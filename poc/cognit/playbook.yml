@@ -1,0 +1,30 @@
+---
+# POC Cognit – add project apt repo and install package on frontend.
+# Run after one-deploy has installed the OpenNebula frontend.
+# Usage: ansible-playbook -i poc/cognit/inventory.yml poc/cognit/playbook.yml
+
+- name: Install POC Cognit package on frontend
+  hosts: frontend
+  gather_facts: true
+  vars:
+    cognit_repo_url: "http://5.2.88.196/repo/"
+    cognit_repo_component: "poc-cognit"
+    cognit_package: "opennebula-cognit-frontend"
+  tasks:
+    - name: Add POC Cognit apt repository
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/cognit.list
+        content: "deb [trusted=yes] {{ cognit_repo_url }} {{ ansible_distribution_release }} {{ cognit_repo_component }}\n"
+        mode: "0644"
+      when: ansible_os_family == "Debian"
+
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+      when: ansible_os_family == "Debian"
+
+    - name: Install POC Cognit frontend package
+      ansible.builtin.apt:
+        name: "{{ cognit_package }}"
+        state: present
+      when: ansible_os_family == "Debian"
