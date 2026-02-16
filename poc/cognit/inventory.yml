@@ -5,7 +5,15 @@
 all:
   vars:
     ansible_user: root
-    one_version: "6.8"
+    update_pkg_cache: true
+    ensure_hostname: true
+    ensure_hosts: true
+    one_version: "7.1"
+    # Internal Jenkins build repo with ONE 7.1.80 for Ubuntu 24.04
+    # Forwarded via socat on laptop: 172.20.0.1:8081 -> jenkins.devel:80
+    opennebula_repo_url:
+      Ubuntu: "http://172.20.0.1:8081/html/build/7.1.80-e7cfdfbd-bfb244f7-1016/ubuntu2404/repo/Ubuntu/24.04"
+    opennebula_repo_force_trusted: true
     one_pass: opennebulapass
     db_backend: SQLite
     ds:
@@ -30,3 +38,6 @@ frontend:
   hosts:
     f1:
       ansible_host: 172.20.0.4  # set to your Ubuntu 24 VM IP
+
+node:
+  hosts: {}  # empty, required by one-deploy common role

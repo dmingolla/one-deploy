@@ -1,0 +1,6 @@
+---
+# One command: OpenNebula frontend first, then Cognit repo + package.
+# Run: ansible-playbook -i poc/cognit/inventory.yml poc/cognit/run-all.yml
+- ansible.builtin.import_playbook: opennebula.deploy.pre
+- ansible.builtin.import_playbook: opennebula.deploy.site
+- ansible.builtin.import_playbook: playbook.yml
