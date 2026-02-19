@@ -33,7 +33,7 @@ onevm ssh <VM_ID> --cmd "curl -sI http://172.20.0.1:8081/html/build/7.1.80-e7cfd
 onevm ssh <VM_ID> --cmd "curl -sI http://5.2.88.196/repo/"
 ```
 
-Both should return HTTP 200. If the second fails, run on the OpenNebula host: `sudo ./poc/cognit/scripts/enable-vm-repo-access.sh`
+Both should return HTTP 200. If the VM cannot reach 5.2.88.196, enable NAT on the OpenNebula host so the VM network can reach the repo.
 
 **4. Run everything (OpenNebula + Cognit)**
 
