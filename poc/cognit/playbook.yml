@@ -9,7 +9,10 @@
   vars:
     cognit_repo_url: "http://5.2.88.196/repo/"
     cognit_repo_component: "poc-cognit"
-    cognit_package: "opennebula-cognit-frontend"
+    cognit_packages:
+      - opennebula-cognit-frontend
+      - opennebula-cognit-optimizer
+      - opennebula-cognit-devices-estimated-load
   tasks:
     - name: Add POC Cognit apt repository
       ansible.builtin.copy:
@@ -23,8 +26,8 @@
         update_cache: true
       when: ansible_os_family == "Debian"
 
-    - name: Install POC Cognit frontend package
+    - name: Install POC Cognit packages
       ansible.builtin.apt:
-        name: "{{ cognit_package }}"
+        name: "{{ cognit_packages }}"
         state: present
       when: ansible_os_family == "Debian"
