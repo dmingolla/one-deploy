@@ -1,9 +1,9 @@
 ---
-# POC Cognit – add project apt repo and install package on frontend.
+# POC Cognit – add project apt repo, create venv, install packages on frontend.
 # Run after one-deploy has installed the OpenNebula frontend.
 # Usage: ansible-playbook -i poc/cognit/inventory.yml poc/cognit/playbook.yml
 
-- name: Install POC Cognit package on frontend
+- name: Install POC Cognit on frontend
   hosts: frontend
   gather_facts: true
   vars:
@@ -13,7 +13,47 @@
       - opennebula-cognit-frontend
       - opennebula-cognit-optimizer
       - opennebula-cognit-devices-estimated-load
+    cognit_venv_path: "/usr/share/one/cognit-frontend/python-venv"
+    cognit_requirements: "{{ playbook_dir }}/cognit_deb_requirements.txt"
   tasks:
+    # --- Python venv setup (before deb packages so services can start) ---
+
+    - name: Install git (needed for pyoneai from GitHub)
+      ansible.builtin.apt:
+        name: [git]
+        state: present
+      when: ansible_os_family == "Debian"
+
+    - name: Install uv
+      ansible.builtin.shell:
+        cmd: curl -LsSf https://astral.sh/uv/install.sh | sh
+        creates: /root/.local/bin/uv
+
+    - name: Create Python virtualenv with uv
+      ansible.builtin.shell:
+        cmd: /root/.local/bin/uv venv {{ cognit_venv_path }}
+        creates: "{{ cognit_venv_path }}/bin/python"
+
+    - name: Copy locked requirements to target
+      ansible.builtin.copy:
+        src: "{{ cognit_requirements }}"
+        dest: /tmp/cognit-requirements.lock
+        mode: "0644"
+
+    - name: Rewrite git URLs to use token auth (when no SSH agent)
+      ansible.builtin.replace:
+        path: /tmp/cognit-requirements.lock
+        regexp: 'git\+ssh://git@github\.com/'
+        replace: 'git+https://x-access-token:{{ github_token }}@github.com/'
+      when: github_token is defined and github_token | length > 0
+      no_log: true
+
+    - name: Install locked requirements with uv
+      ansible.builtin.shell:
+        cmd: /root/.local/bin/uv pip install --python {{ cognit_venv_path }}/bin/python -r /tmp/cognit-requirements.lock
+
+    # --- Cognit apt packages ---
+
     - name: Add POC Cognit apt repository
       ansible.builtin.copy:
         dest: /etc/apt/sources.list.d/cognit.list

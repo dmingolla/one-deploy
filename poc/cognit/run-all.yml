@@ -1,13 +1,34 @@
 ---
 # One command: OpenNebula frontend first, then Cognit repo + package.
 # Run: ansible-playbook -i poc/cognit/inventory.yml poc/cognit/run-all.yml
-- name: Set hostname from inventory (so precheck passes)
+- name: Bootstrap host and configure internal ONE repo
   hosts: frontend
   gather_facts: true
+  vars:
+    one_internal_repo_url: "http://5.2.88.196/repo/"
+    one_internal_repo_component: "poc-oneai" # TODO: Change to poc-cognit once we have all the packages there
   tasks:
     - name: Set hostname to inventory name
       ansible.builtin.hostname:
         name: "{{ inventory_hostname }}"
+
+    - name: Add internal OpenNebula APT repo
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/opennebula.list
+        content: "deb [trusted=yes] {{ one_internal_repo_url }} {{ ansible_distribution_release }} {{ one_internal_repo_component }}\n"
+        mode: "0644"
+      when: ansible_os_family == "Debian"
+
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+      when: ansible_os_family == "Debian"
+
+    - name: Prevent one-deploy server role from overwriting the repo
+      ansible.builtin.set_fact:
+        opennebula_repo:
+          changed: true
+          dest: /etc/apt/sources.list.d/opennebula.list
 
 - ansible.builtin.import_playbook: opennebula.deploy.pre
 - ansible.builtin.import_playbook: opennebula.deploy.site
