@@ -18,6 +18,12 @@
         state: present
       when: ansible_os_family == "Debian"
 
+    - name: Ensure GitHub SSH host key is trusted
+      ansible.builtin.known_hosts:
+        name: github.com
+        key: "{{ lookup('pipe', 'ssh-keyscan -t ed25519 github.com 2>/dev/null') }}"
+        state: present
+
     - name: Install uv
       ansible.builtin.shell:
         cmd: curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -65,3 +71,52 @@
         - opennebula-cognit-frontend
         - opennebula-cognit-optimizer
         - opennebula-cognit-devices-estimated-load
+
+    # --- Replace default marketplaces with Cognit marketplace ---
+
+    - name: Get existing marketplaces
+      ansible.builtin.command:
+        cmd: onemarket list -l ID --no-header
+      register: existing_markets
+      changed_when: false
+      become: true
+      become_user: oneadmin
+
+    - name: Disable default marketplaces (removes any apps)
+      ansible.builtin.command:
+        cmd: "onemarket disable {{ item }}"
+      loop: "{{ existing_markets.stdout_lines | map('trim') | list }}"
+      when: existing_markets.stdout_lines | length > 0
+      failed_when: false
+      become: true
+      become_user: oneadmin
+
+    - name: Delete default marketplaces
+      ansible.builtin.command:
+        cmd: "onemarket delete {{ item }}"
+      loop: "{{ existing_markets.stdout_lines | map('trim') | list }}"
+      when: existing_markets.stdout_lines | length > 0
+      become: true
+      become_user: oneadmin
+
+    - name: Copy Cognit marketplace template
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/cognit_marketplace.tmpl"
+        dest: /tmp/cognit_marketplace.tmpl
+        mode: "0644"
+
+    - name: Check if Cognit marketplace already exists
+      ansible.builtin.shell:
+        cmd: onemarket list --no-header | grep -q "Cognit Marketplace"
+      register: cognit_market_check
+      changed_when: false
+      failed_when: false
+      become: true
+      become_user: oneadmin
+
+    - name: Create Cognit marketplace
+      ansible.builtin.command:
+        cmd: onemarket create /tmp/cognit_marketplace.tmpl
+      when: cognit_market_check.rc != 0
+      become: true
+      become_user: oneadmin
