@@ -6,7 +6,7 @@
   gather_facts: true
   vars:
     one_internal_repo_url: "http://5.2.88.196/repo/"
-    one_internal_repo_component: "poc-oneai" # TODO: Change to poc-cognit once we have all the packages there
+    one_internal_repo_component: "poc-cognit"
   tasks:
     - name: Set hostname to inventory name
       ansible.builtin.hostname:
