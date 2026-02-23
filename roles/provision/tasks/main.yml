@@ -12,7 +12,7 @@
       ansible.builtin.package:
         name: "{{ _common }}"
       vars:
-        _common: [gawk, opennebula-provision]
+        _common: [gawk, opennebula-form]
       register: package
       until: package is success
       retries: 6

@@ -134,3 +134,118 @@
         cmd: onehook create /usr/share/one/geo_carbon_hook.tmpl
       become: true
       become_user: oneadmin
+
+    # --- Fix: remove stale terraform that shadows the opennebula-form one ---
+
+    - name: Remove stale /usr/local/bin/terraform (opennebula-form ships /usr/bin/terraform)
+      ansible.builtin.file:
+        path: /usr/local/bin/terraform
+        state: absent
+      when: ansible_os_family == "Debian"
+
+    # --- Fix: patch KVM monitoring bug (info_each discards super return value) ---
+
+    - name: Patch kvm.rb info_each to return super result instead of nil
+      ansible.builtin.replace:
+        path: /var/lib/one/remotes/im/lib/kvm.rb
+        regexp: '(\s+)def info_each\(do_process\)\n(\s+)super\(do_process\)\n(\s+)vms_power\n(\s+)end'
+        replace: '\1def info_each(do_process)\n\2result = super(do_process)\n\3vms_power\n\3result\n\4end'
+      register: kvm_patch
+
+    - name: Sync patched remotes to all hosts
+      ansible.builtin.command:
+        cmd: onehost sync --force
+      become: true
+      become_user: oneadmin
+      when: kvm_patch.changed
+
+    # --- Deploy custom Cognit OnPrem driver for OneForm ---
+
+    - name: Deploy Cognit onprem driver to OneForm external directory
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/drivers/cognit_onprem/"
+        dest: /var/lib/one/oneform/drivers/cognit/cognit_onprem/
+        owner: oneadmin
+        group: oneadmin
+        mode: "0755"
+        directory_mode: "0755"
+
+    - name: Enable and restart OneForm server
+      ansible.builtin.service:
+        name: opennebula-form
+        enabled: true
+        state: restarted
+
+    - name: Wait for OneForm API to be ready
+      ansible.builtin.uri:
+        url: http://127.0.0.1:13013
+        status_code: [200, 401]
+      register: oneform_health
+      retries: 10
+      delay: 3
+      until: oneform_health is not failed
+
+    # --- Provision edge cluster via OneForm ---
+
+    - when: edge_host_ips is defined and edge_host_ips | length > 0
+      block:
+        - name: Read oneadmin public SSH key
+          ansible.builtin.slurp:
+            src: /var/lib/one/.ssh/id_rsa.pub
+          register: oneadmin_pubkey
+
+        - name: Authorize oneadmin SSH key for root@localhost (needed by OneForm Ansible)
+          ansible.builtin.authorized_key:
+            user: root
+            key: "{{ oneadmin_pubkey.content | b64decode }}"
+
+        - name: Distribute oneadmin SSH key to edge hosts
+          ansible.builtin.authorized_key:
+            user: root
+            key: "{{ oneadmin_pubkey.content | b64decode }}"
+          delegate_to: "{{ item }}"
+          loop: "{{ edge_host_ips }}"
+
+        - name: Create Cognit OnPrem provider
+          ansible.builtin.command:
+            cmd: oneprovider create cognit_onprem
+          become: true
+          become_user: oneadmin
+          register: provider_result
+
+        - name: Extract provider ID
+          ansible.builtin.set_fact:
+            cognit_provider_id: "{{ provider_result.stdout | regex_search('ID:\\s*(\\d+)', '\\1') | first }}"
+
+        - name: Render provision inputs JSON
+          ansible.builtin.copy:
+            dest: /tmp/cognit_provision_inputs.json
+            mode: "0644"
+            content: |
+              {
+                "user_inputs_values": {
+                  "oneform_onprem_hosts": {{ edge_host_ips | to_json }},
+                  "phydev_name": "eth0",
+                  "network_address": "{{ vn.admin_net.template.NETWORK_ADDRESS | default('172.20.0.0') }}",
+                  "network_mask": "{{ vn.admin_net.template.NETWORK_MASK | default('255.255.255.0') }}",
+                  "gateway": "{{ vn.admin_net.template.GATEWAY | default('172.20.0.1') }}",
+                  "dns": "{{ vn.admin_net.template.DNS | default('1.1.1.1') }}",
+                  "ip": "{{ vn.admin_net.template.AR.IP | default('172.20.0.100') }}",
+                  "size": {{ vn.admin_net.template.AR.SIZE | default(48) }}
+                }
+              }
+
+        - name: Create edge cluster provision
+          ansible.builtin.command:
+            cmd: >-
+              oneprovision create cognit_onprem
+              -p {{ cognit_provider_id }}
+              -d ssh_cluster
+              /tmp/cognit_provision_inputs.json
+          become: true
+          become_user: oneadmin
+          register: provision_result
+
+        - name: Show provision result
+          ansible.builtin.debug:
+            msg: "Edge cluster provision created: {{ provision_result.stdout }}"

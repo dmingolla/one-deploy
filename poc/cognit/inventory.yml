@@ -14,6 +14,12 @@ all:
     repos_enabled: [ceph, frr, grafana]
     one_pass: opennebulapass
     db_backend: SQLite
+    features:
+      provision: true
+    # Edge host IPs for oneprovision (used by playbook.yml)
+    edge_host_ips:
+      - 172.20.0.4  # cognit-edge-host-1 (VM 1112)
+      # - 172.20.0.X  # add more as needed
     ds:
       mode: ssh
     vn:
@@ -35,7 +41,7 @@ all:
 frontend:
   hosts:
     f1:
-      ansible_host: 172.20.0.4  # TODO: set to your Ubuntu 24 VM IP
+      ansible_host: 172.20.0.78  # cognit-frontend (VM 1113)
 
 node:
   hosts: {}  # empty, required by one-deploy common role
