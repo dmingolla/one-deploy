@@ -120,3 +120,17 @@
       when: cognit_market_check.rc != 0
       become: true
       become_user: oneadmin
+
+    # --- Install geocoder gem (needed by geo-carbon hook) ---
+
+    - name: Install geocoder Ruby gem into OpenNebula gem path
+      ansible.builtin.command:
+        cmd: gem install geocoder -v 1.8.6 --install-dir /usr/share/one/gems --no-document
+
+    # --- Register the geo-carbon hook ---
+
+    - name: Create geo-carbon-hook
+      ansible.builtin.command:
+        cmd: onehook create /usr/share/one/geo_carbon_hook.tmpl
+      become: true
+      become_user: oneadmin

@@ -10,9 +10,7 @@ all:
     ensure_hostname: true
     ensure_hosts: true
     one_version: "7.1"
-    # Disable one-deploy's built-in opennebula repo setup (we configure it
-    # manually in run-all.yml because the internal repo uses a different
-    # dist/component layout than what one-deploy expects).
+    # Disable one-deploy's built-in opennebula repo setup
     repos_enabled: [ceph, frr, grafana]
     one_pass: opennebulapass
     db_backend: SQLite
@@ -37,7 +35,7 @@ all:
 frontend:
   hosts:
     f1:
-      ansible_host: 172.20.0.4  # set to your Ubuntu 24 VM IP
+      ansible_host: 172.20.0.4  # TODO: set to your Ubuntu 24 VM IP
 
 node:
   hosts: {}  # empty, required by one-deploy common role
