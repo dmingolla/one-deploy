@@ -1,7 +1,4 @@
 ---
-# POC Cognit – frontend-only inventory for one-deploy + cognit packages.
-# Edge hosts are provisioned by oneprovision (stock onprem driver),
-# NOT by one-deploy directly. Set their IPs in edge_host_ips below.
 
 all:
   vars:
@@ -17,12 +14,11 @@ all:
     db_backend: SQLite
     features:
       provision: true
-    # Allow pip install of ansible-core for oneadmin on Python 3.12+ (PEP 668)
     _pip_extra_args: "--break-system-packages"
     # Edge host IPs for oneprovision (stock onprem driver)
     edge_host_ips:
-      - 172.20.0.78
-      # - 172.20.0.X  # add more as needed
+      - 172.20.0.78 # TODO: To change with the correct IP as needed
+      # - 172.20.0.X  # To add more as needed
     ds:
       mode: ssh
     vn:
@@ -44,7 +40,7 @@ all:
 frontend:
   hosts:
     f1:
-      ansible_host: 172.20.0.4
+      ansible_host: 172.20.0.4 # TODO: To change with the correct IP as needed
 
 node:
   hosts: {}

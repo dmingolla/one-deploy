@@ -1,0 +1,588 @@
+---
+# Edge cluster provisioning + OneFlow service deployment for a given flavour.
+# Assumes the Cognit frontend is already deployed (cognit-frontend.yml).
+#
+# Usage:
+#   ansible-playbook -i poc/cognit/inventory.yml poc/cognit/edge-cluster.yml \
+#     -e flavour=NatureFR
+#
+# Network for the OneFlow service is set automatically from the provision cluster (no override).
+#
+# Available flavours (must match marketplace app names):
+#   NatureFR, SmartCity, EnergyTorch, Energy, CyberSecurity
+
+- name: Deploy edge cluster and OneFlow service ({{ flavour | default('UNDEFINED') }})
+  hosts: frontend
+  gather_facts: true
+  vars:
+    marketplace_datastore_id: 1
+    # OneFlow dynamic network name in the service template (fixed)
+    flow_network_name: "Private"
+  pre_tasks:
+    - name: Validate flavour parameter
+      ansible.builtin.assert:
+        that: flavour is defined and flavour | length > 0
+        fail_msg: >-
+          'flavour' variable is required. Pass it with -e flavour=NatureFR
+          (valid: NatureFR, SmartCity, EnergyTorch, Energy, CyberSecurity)
+  tasks:
+    # ===================================================================
+    # Part A: Edge cluster provisioning via oneprovision (stock onprem)
+    # ===================================================================
+
+    - when: edge_host_ips is defined and edge_host_ips | length > 0
+      block:
+        # --- SSH key distribution ---
+
+        - name: Read oneadmin public SSH key
+          ansible.builtin.slurp:
+            src: /var/lib/one/.ssh/id_rsa.pub
+          register: oneadmin_pubkey
+
+        - name: Authorize oneadmin SSH key for root@localhost (needed by OneForm Ansible)
+          ansible.builtin.authorized_key:
+            user: root
+            key: "{{ oneadmin_pubkey.content | b64decode }}"
+
+        - name: Distribute oneadmin SSH key to edge hosts
+          ansible.builtin.authorized_key:
+            user: root
+            key: "{{ oneadmin_pubkey.content | b64decode }}"
+          delegate_to: "{{ item }}"
+          loop: "{{ edge_host_ips }}"
+
+        # --- Pre-configure edge hosts (before oneprovision adds them) ---
+
+        - name: Stop unattended-upgrades on edge hosts (holds dpkg lock on fresh VMs)
+          ansible.builtin.shell:
+            cmd: |
+              systemctl stop unattended-upgrades 2>/dev/null
+              systemctl stop apt-daily.timer apt-daily-upgrade.timer 2>/dev/null
+              systemctl disable apt-daily.timer apt-daily-upgrade.timer 2>/dev/null
+              true
+          delegate_to: "{{ item }}"
+          loop: "{{ edge_host_ips }}"
+          changed_when: false
+          failed_when: false
+
+        - name: Purge unattended-upgrades on edge hosts
+          ansible.builtin.apt:
+            name: unattended-upgrades
+            state: absent
+            purge: true
+          delegate_to: "{{ item }}"
+          loop: "{{ edge_host_ips }}"
+          failed_when: false
+
+        - name: Pre-write private APT repo on edge hosts
+          ansible.builtin.copy:
+            dest: /etc/apt/sources.list.d/opennebula.list
+            content: "deb [trusted=yes] {{ one_internal_repo_url | default('http://5.2.88.196/repo/') }} {{ hostvars[item]['ansible_distribution_release'] | default('noble') }} {{ one_internal_repo_component | default('poc-cognit') }}\n"
+            mode: "0644"
+          delegate_to: "{{ item }}"
+          loop: "{{ edge_host_ips }}"
+
+        - name: Update APT cache on edge hosts
+          ansible.builtin.apt:
+            update_cache: true
+          delegate_to: "{{ item }}"
+          loop: "{{ edge_host_ips }}"
+
+        - name: Install sqlite3 Ruby gem on edge hosts (needed by monitoring probes)
+          ansible.builtin.command:
+            cmd: gem install sqlite3
+          delegate_to: "{{ item }}"
+          loop: "{{ edge_host_ips }}"
+          register: gem_result
+          changed_when: "'Successfully installed' in (gem_result.stdout | default(''))"
+          failed_when: false
+
+        # --- Patch onprem driver template so OneForm Ansible uses our repo ---
+
+        - name: Inject private repo vars into OnPrem ssh_cluster deployment template
+          ansible.builtin.shell:
+            cmd: |
+              python3 << 'PYEOF'
+              path = '/usr/lib/one/oneform/drivers/onprem/ansible/templates/ssh_cluster.j2'
+              marker = '# BEGIN COGNIT PRIVATE REPO OVERRIDE'
+              with open(path) as f:
+                  lines = f.readlines()
+              if any(marker in line for line in lines):
+                  print('ALREADY_PATCHED')
+              else:
+                  out = []
+                  for line in lines:
+                      out.append(line)
+                      if 'one_version:' in line and (line.find(chr(123) + chr(35)) == -1):
+                          out.append('    # BEGIN COGNIT PRIVATE REPO OVERRIDE\n')
+                          out.append('    repos_enabled: [ceph, frr, grafana]\n')
+                          out.append('    opennebula_repo: {changed: false}\n')
+                          out.append('    # END COGNIT PRIVATE REPO OVERRIDE\n')
+                  with open(path, 'w') as f:
+                      f.writelines(out)
+                  print('PATCHED')
+              PYEOF
+          register: template_patch
+          changed_when: "'PATCHED' == (template_patch.stdout | default('') | trim)"
+
+        # --- Create provider + provision ---
+
+        - name: Check if OnPrem provider already exists
+          ansible.builtin.shell:
+            cmd: oneprovider list --no-header | grep -i onprem | awk '{print $1}'
+          become: true
+          become_user: oneadmin
+          register: existing_provider
+          changed_when: false
+          failed_when: false
+
+        - name: Create OnPrem provider (stock driver)
+          ansible.builtin.command:
+            cmd: oneprovider create onprem
+          become: true
+          become_user: oneadmin
+          register: provider_result
+          when: existing_provider.stdout | trim | length == 0
+
+        - name: Extract provider ID
+          ansible.builtin.set_fact:
+            cognit_provider_id: "{{ existing_provider.stdout | trim if (existing_provider.stdout | trim | length > 0) else (provider_result.stdout | regex_search('ID:\\s*(\\d+)', '\\1') | first) }}"
+
+        - name: Render provision inputs JSON
+          ansible.builtin.copy:
+            dest: /tmp/provision_inputs.json
+            mode: "0644"
+            content: |
+              {
+                "user_inputs_values": {
+                  "oneform_onprem_hosts": {{ edge_host_ips | to_json }},
+                  "phydev_name": "eth0",
+                  "network_address": "{{ vn.admin_net.template.NETWORK_ADDRESS | default('172.20.0.0') }}",
+                  "network_mask": "{{ vn.admin_net.template.NETWORK_MASK | default('255.255.255.0') }}",
+                  "gateway": "{{ vn.admin_net.template.GATEWAY | default('172.20.0.1') }}",
+                  "dns": "{{ vn.admin_net.template.DNS | default('1.1.1.1') }}",
+                  "ip": "{{ vn.admin_net.template.AR.IP | default('172.20.0.100') }}",
+                  "size": {{ vn.admin_net.template.AR.SIZE | default(48) }}
+                }
+              }
+
+        - name: Check if a provision already exists
+          ansible.builtin.shell:
+            cmd: oneprovision list --no-header | awk 'NF{print $1}'
+          become: true
+          become_user: oneadmin
+          register: existing_provision
+          changed_when: false
+          failed_when: false
+
+        - name: Create edge cluster provision (stock onprem driver)
+          ansible.builtin.command:
+            cmd: >-
+              oneprovision create onprem
+              -p {{ cognit_provider_id }}
+              -d ssh_cluster
+              /tmp/provision_inputs.json
+          become: true
+          become_user: oneadmin
+          register: provision_result
+          when: existing_provision.stdout | trim | length == 0
+
+        - name: Show provision result
+          ansible.builtin.debug:
+            msg: "{{ provision_result.stdout | default('provision already exists') }}"
+
+        # --- Wait for provision to finish (it runs asynchronously) ---
+
+        - name: Wait for provision to reach RUNNING or DONE (up to 10 min)
+          ansible.builtin.shell:
+            cmd: oneprovision list --no-header | head -1
+          become: true
+          become_user: oneadmin
+          register: prov_state
+          retries: 40
+          delay: 15
+          until: >-
+            'RUNNING' in (prov_state.stdout | default(''))
+            or 'DONE' in (prov_state.stdout | default(''))
+          failed_when: "'FAILURE' in (prov_state.stdout | default(''))"
+          changed_when: false
+
+        - name: Assert provision succeeded (state DONE or RUNNING)
+          ansible.builtin.assert:
+            that:
+              - "'DONE' in prov_state.stdout or 'RUNNING' in prov_state.stdout"
+            fail_msg: "Provision did not reach DONE/RUNNING: {{ prov_state.stdout }}"
+
+        # --- Post-provisioning: sync patched remotes to new hosts ---
+
+        - name: Sync patched monitoring remotes to all hosts
+          ansible.builtin.command:
+            cmd: onehost sync --force
+          become: true
+          become_user: oneadmin
+
+        - name: Force monitoring update on all hosts
+          ansible.builtin.shell:
+            cmd: onehost forceupdate $(onehost list --no-header -l ID | tr '\n' ',' | sed 's/,$//')
+          become: true
+          become_user: oneadmin
+          changed_when: false
+          failed_when: false
+
+        - name: Wait for hosts to be monitored (up to 3 min)
+          ansible.builtin.shell:
+            cmd: onehost list --no-header | grep -v 'init\|err'
+          become: true
+          become_user: oneadmin
+          register: host_list
+          retries: 12
+          delay: 15
+          until: host_list.stdout | trim | length > 0
+          changed_when: false
+          failed_when: false
+
+        - name: Show final host status
+          ansible.builtin.shell:
+            cmd: onehost list
+          become: true
+          become_user: oneadmin
+          register: host_final
+          changed_when: false
+
+        - name: Host status
+          ansible.builtin.debug:
+            msg: "{{ host_final.stdout }}"
+
+        - name: Assert no host in error state
+          ansible.builtin.assert:
+            that: "'err' not in host_final.stdout"
+            fail_msg: "At least one host is in error. onehost list: {{ host_final.stdout }}"
+
+        - name: Get monitored host count
+          ansible.builtin.shell:
+            cmd: onehost list --no-header | wc -l
+          become: true
+          become_user: oneadmin
+          register: host_count_result
+          changed_when: false
+
+        - name: Assert expected number of hosts are present
+          ansible.builtin.assert:
+            that: "host_count_result.stdout | trim | int >= (edge_host_ips | length)"
+            fail_msg: "Expected at least {{ edge_host_ips | length }} host(s), got {{ host_count_result.stdout | trim }}. onehost list: {{ host_final.stdout }}"
+
+    # ===================================================================
+    # Part B: Export marketplace app + deploy OneFlow service
+    # ===================================================================
+
+    # --- Step 1: Check if service template already exported ---
+
+    - name: Check if service template for {{ flavour }} already exists
+      ansible.builtin.shell:
+        cmd: >-
+          oneflow-template list --json 2>/dev/null |
+          jq -re '(if type=="array" then .[] else ((.DOCUMENT_POOL.DOCUMENT // []) | if type=="array" then .[] else . end) end) | select(.NAME=="Service {{ flavour }}") | .ID' |
+          head -1
+      become: true
+      become_user: oneadmin
+      register: existing_service_template
+      changed_when: false
+      failed_when: false
+
+    # --- Step 2: Find and export the marketplace app ---
+
+    - when: existing_service_template.stdout | trim | length == 0
+      block:
+        - name: Get Cognit Marketplace ID
+          ansible.builtin.shell:
+            cmd: onemarket list --no-header | grep -i "Cognit Marketplace" | awk '{print $1}'
+          become: true
+          become_user: oneadmin
+          register: cognit_market_id
+          changed_when: false
+
+        - name: Disable Cognit marketplace to trigger app refresh
+          ansible.builtin.command:
+            cmd: onemarket disable {{ cognit_market_id.stdout | trim }}
+          become: true
+          become_user: oneadmin
+          when: cognit_market_id.stdout | trim | length > 0
+
+        - name: Enable Cognit marketplace
+          ansible.builtin.command:
+            cmd: onemarket enable {{ cognit_market_id.stdout | trim }}
+          become: true
+          become_user: oneadmin
+          when: cognit_market_id.stdout | trim | length > 0
+
+        - name: Wait for marketplace app 'Service {{ flavour }}' to appear (up to 5 min)
+          ansible.builtin.shell:
+            cmd: >-
+              onemarketapp list --no-header -f "NAME=Service {{ flavour }}" -l ID |
+              awk 'NR==1{print $1}'
+          become: true
+          become_user: oneadmin
+          register: market_app_id
+          retries: 20
+          delay: 15
+          until: market_app_id.stdout is defined and (market_app_id.stdout | trim | length) > 0
+          changed_when: false
+
+        - name: Assert marketplace app exists for flavour {{ flavour }}
+          ansible.builtin.assert:
+            that: market_app_id.stdout | trim | length > 0
+            fail_msg: >-
+              No marketplace app found with name 'Service {{ flavour }}'.
+              Available apps: run 'onemarketapp list' to see options.
+
+        - name: Export 'Service {{ flavour }}' from marketplace (with images and templates)
+          ansible.builtin.command:
+            argv:
+              - onemarketapp
+              - export
+              - "{{ market_app_id.stdout | trim }}"
+              - "Service {{ flavour }}"
+              - -d
+              - "{{ marketplace_datastore_id }}"
+          become: true
+          become_user: oneadmin
+          register: export_result
+
+        - name: Show export result
+          ansible.builtin.debug:
+            msg: "{{ export_result.stdout }}"
+
+    # --- Step 3: Wait for all Cognit images to be ready (downloads can take 30+ min) ---
+
+    - name: Wait for all Cognit images to reach READY state (up to 45 min)
+      ansible.builtin.shell:
+        cmd: >-
+          oneimage list --no-header |
+          grep -i 'Cognit' |
+          grep -v ' rdy ' |
+          wc -l
+      become: true
+      become_user: oneadmin
+      register: images_not_ready
+      retries: 90
+      delay: 30
+      until: (images_not_ready.stdout | trim | int) == 0
+      changed_when: false
+
+    - name: Check for images in error state
+      ansible.builtin.shell:
+        cmd: >-
+          oneimage list --no-header |
+          grep -i 'Cognit' |
+          grep ' err '
+      become: true
+      become_user: oneadmin
+      register: images_in_error
+      changed_when: false
+      failed_when: false
+
+    - name: Assert no Cognit images are in error state
+      ansible.builtin.assert:
+        that: images_in_error.stdout | trim | length == 0
+        fail_msg: "One or more Cognit images are in ERROR state: {{ images_in_error.stdout }}"
+
+    # --- Step 4: Find the service template ID (needed for VM template discovery and instantiation) ---
+
+    - name: Get service template ID for 'Service {{ flavour }}'
+      ansible.builtin.shell:
+        cmd: >-
+          oneflow-template list --json |
+          jq -r '(if type=="array" then .[] else ((.DOCUMENT_POOL.DOCUMENT // []) | if type=="array" then .[] else . end) end) | select(.NAME=="Service {{ flavour }}") | .ID' |
+          head -1
+      become: true
+      become_user: oneadmin
+      register: service_template_id
+      changed_when: false
+
+    - name: Assert service template was found
+      ansible.builtin.assert:
+        that: service_template_id.stdout | trim | length > 0
+        fail_msg: >-
+          Could not find OneFlow service template for 'Service {{ flavour }}'
+          after marketplace export. Check 'oneflow-template list'.
+
+    # --- TEMPORARY: Reduce service VM memory so it fits on small edge host ---
+    # TODO: This is a temporary workaround. On-prem (ssh_cluster) provision does
+    # not allow node resource (memory/CPU) decisions
+
+    - name: Get VM template IDs from OneFlow service template (roles)
+      ansible.builtin.shell:
+        cmd: >-
+          oneflow-template show {{ service_template_id.stdout | trim }} --json |
+          jq -r '(.DOCUMENT.TEMPLATE.BODY // .TEMPLATE.BODY).roles[]?.template_id // .vm_template // empty' |
+          sort -u
+      become: true
+      become_user: oneadmin
+      register: service_vm_template_ids
+      changed_when: false
+
+    - name: Temporary – write memory override for small edge host (1024 MB)
+      ansible.builtin.copy:
+        dest: /tmp/oneflow_memory_override.txt
+        content: "MEMORY=1024\n"
+        mode: "0644"
+
+    - name: Temporary – set each service VM template memory to 1024 MB
+      ansible.builtin.command:
+        cmd: onetemplate update {{ item }} /tmp/oneflow_memory_override.txt --append
+      become: true
+      become_user: oneadmin
+      loop: "{{ service_vm_template_ids.stdout_lines | default([]) | map('trim') | select() | list }}"
+      register: _tmpl_mem
+      changed_when: _tmpl_mem.rc == 0
+      failed_when: false
+
+    # --- Step 4b: Resolve OneFlow network from provision cluster (so service uses same network as edge) ---
+
+    - name: Get provision cluster ID (highest ID from onecluster list)
+      ansible.builtin.shell:
+        cmd: onecluster list --no-header | awk '{print $1}' | sort -n | tail -1
+      become: true
+      become_user: oneadmin
+      register: provision_cluster_id
+      changed_when: false
+
+    - name: Get first VNET ID in provision cluster
+      ansible.builtin.shell:
+        cmd: onevnet list --no-header | awk -v c={{ provision_cluster_id.stdout | trim }} '$5==c {print $1; exit}'
+      become: true
+      become_user: oneadmin
+      register: provision_vnet_id
+      changed_when: false
+
+    - name: Set flow_network_id from provision cluster
+      ansible.builtin.set_fact:
+        flow_network_id: "{{ provision_vnet_id.stdout | trim }}"
+
+    - name: Assert provision cluster has a network
+      ansible.builtin.assert:
+        that: flow_network_id | length > 0
+        fail_msg: "No VNET found in provision cluster (ID {{ provision_cluster_id.stdout | trim }}). Run oneprovision first."
+
+    - name: Show OneFlow network used for instantiation
+      ansible.builtin.debug:
+        msg: "Using VNET ID {{ flow_network_id }} for dynamic network '{{ flow_network_name }}' (provision cluster {{ provision_cluster_id.stdout | trim }})"
+
+    - name: Add marketplace datastore to provision cluster (VM disk and NIC must be in same cluster)
+      ansible.builtin.command:
+        cmd: onecluster adddatastore {{ provision_cluster_id.stdout | trim }} {{ marketplace_datastore_id }}
+      become: true
+      become_user: oneadmin
+      register: cluster_add_ds
+      changed_when: cluster_add_ds.rc == 0 and "already" not in (cluster_add_ds.stderr | default('') + cluster_add_ds.stdout | default(''))
+      failed_when: false
+
+    # --- Step 5: Check for existing service, then instantiate ---
+
+    - name: Check if a service for '{{ flavour }}' is already running
+      ansible.builtin.shell:
+        cmd: >-
+          oneflow list --json 2>/dev/null |
+          jq -re '(if type=="array" then .[] else ((.DOCUMENT_POOL.DOCUMENT // []) | if type=="array" then .[] else . end) end) | select(.NAME | contains("{{ flavour }}")) | .ID' |
+          head -1
+      become: true
+      become_user: oneadmin
+      register: existing_service
+      changed_when: false
+      failed_when: false
+
+    - name: Write OneFlow instantiation options (use existing network)
+      ansible.builtin.copy:
+        dest: /tmp/flow_instantiate_{{ flavour }}.json
+        content: '{"networks_values": [{"{{ flow_network_name }}": {"id": "{{ flow_network_id }}"}}]}'
+        mode: "0644"
+      when: existing_service.stdout | trim | length == 0
+
+    - name: Instantiate OneFlow service from template {{ service_template_id.stdout | trim }}
+      ansible.builtin.command:
+        cmd: >-
+          oneflow-template instantiate {{ service_template_id.stdout | trim }}
+          /tmp/flow_instantiate_{{ flavour }}.json
+      become: true
+      become_user: oneadmin
+      register: instantiate_result
+      when: existing_service.stdout | trim | length == 0
+
+    - name: Show instantiation result
+      ansible.builtin.debug:
+        msg: "{{ instantiate_result.stdout | default('Service already exists (ID ' + existing_service.stdout | trim + ')') }}"
+
+    # --- Step 6: Resolve service ID ---
+
+    - name: Get service ID
+      ansible.builtin.shell:
+        cmd: >-
+          oneflow list --json |
+          jq -r '(if type=="array" then .[] else ((.DOCUMENT_POOL.DOCUMENT // []) | if type=="array" then .[] else . end) end) | select(.NAME | contains("{{ flavour }}")) | .ID' |
+          head -1
+      become: true
+      become_user: oneadmin
+      register: final_service_id
+      changed_when: false
+
+    - name: Assert service exists
+      ansible.builtin.assert:
+        that: final_service_id.stdout | trim | length > 0
+        fail_msg: "Could not find running service for '{{ flavour }}'. Check 'oneflow list'."
+
+    # --- Step 7: Wait for the service to reach RUNNING state ---
+
+    - name: Wait for OneFlow service to reach RUNNING state (up to 15 min)
+      ansible.builtin.shell:
+        cmd: >-
+          oneflow show {{ final_service_id.stdout | trim }} --json |
+          jq -r '(.DOCUMENT.TEMPLATE.BODY // .TEMPLATE.BODY).state'
+      become: true
+      become_user: oneadmin
+      register: service_state
+      retries: 30
+      delay: 30
+      until: (service_state.stdout | trim) == "2"
+      changed_when: false
+
+    # --- Step 8: Verify all VMs in the service are RUNNING ---
+
+    - name: Get VM IDs from service roles
+      ansible.builtin.shell:
+        cmd: >-
+          oneflow show {{ final_service_id.stdout | trim }} --json |
+          jq -r '(.DOCUMENT.TEMPLATE.BODY // .TEMPLATE.BODY).roles[]?.nodes[]?.vm_info.VM |
+          "\(.ID) \(.NAME) STATE=\(.STATE) LCM=\(.LCM_STATE)"'
+      become: true
+      become_user: oneadmin
+      register: service_vms
+      changed_when: false
+
+    - name: Show service VM status
+      ansible.builtin.debug:
+        msg: "{{ service_vms.stdout_lines }}"
+
+    - name: Assert all service VMs are in ACTIVE/RUNNING state
+      ansible.builtin.shell:
+        cmd: >-
+          oneflow show {{ final_service_id.stdout | trim }} --json |
+          jq -e '[(.DOCUMENT.TEMPLATE.BODY // .TEMPLATE.BODY).roles[]?.nodes[]?.vm_info.VM |
+          select(.STATE != "3" or .LCM_STATE != "3")] | length == 0' > /dev/null &&
+          echo OK || echo NOT_READY
+      become: true
+      become_user: oneadmin
+      register: vms_check
+      changed_when: false
+
+    - name: Assert all VMs are running
+      ansible.builtin.assert:
+        that: vms_check.stdout | trim == "OK"
+        fail_msg: >-
+          Not all service VMs are in RUNNING state.
+          {{ service_vms.stdout }}
+
+    - name: Service {{ flavour }} deployed successfully
+      ansible.builtin.debug:
+        msg: >-
+          OneFlow service '{{ flavour }}' (ID {{ final_service_id.stdout | trim }})
+          is fully deployed and all VMs are running.

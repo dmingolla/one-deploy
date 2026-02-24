@@ -1,6 +1,9 @@
 ---
-# One command: OpenNebula frontend, then Cognit + edge provisioning.
-# Run: ansible-playbook -i poc/cognit/inventory.yml poc/cognit/run-all.yml
+# Full Cognit deployment: bootstrap, one-deploy, Cognit frontend, edge cluster.
+#
+# Usage:
+#   ansible-playbook -i poc/cognit/inventory.yml \
+#     poc/cognit/deploy-frontend-and-node.yml -e flavour=NatureFR
 - name: Bootstrap frontend with internal ONE repo
   hosts: frontend
   gather_facts: true
@@ -32,4 +35,5 @@
 
 - ansible.builtin.import_playbook: opennebula.deploy.pre
 - ansible.builtin.import_playbook: opennebula.deploy.site
-- ansible.builtin.import_playbook: playbook.yml
+- ansible.builtin.import_playbook: cognit-frontend.yml
+- ansible.builtin.import_playbook: edge-cluster.yml
