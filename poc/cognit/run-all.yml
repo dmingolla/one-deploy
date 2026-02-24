@@ -1,7 +1,7 @@
 ---
-# One command: OpenNebula frontend first, then Cognit repo + package.
+# One command: OpenNebula frontend, then Cognit + edge provisioning.
 # Run: ansible-playbook -i poc/cognit/inventory.yml poc/cognit/run-all.yml
-- name: Bootstrap host and configure internal ONE repo
+- name: Bootstrap frontend with internal ONE repo
   hosts: frontend
   gather_facts: true
   vars:
@@ -24,7 +24,7 @@
         update_cache: true
       when: ansible_os_family == "Debian"
 
-    - name: Prevent one-deploy server role from overwriting the repo
+    - name: Prevent one-deploy from overwriting the repo
       ansible.builtin.set_fact:
         opennebula_repo:
           changed: true

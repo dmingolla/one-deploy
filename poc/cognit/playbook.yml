@@ -1,4 +1,8 @@
 ---
+# Cognit overlay: Cognit packages, marketplace, hooks, monitoring fixes,
+# and edge cluster provisioning via oneprovision (stock onprem driver).
+# Runs AFTER opennebula.deploy.site (which installed the ONE frontend).
+
 - name: Install POC Cognit on frontend
   hosts: frontend
   gather_facts: true
@@ -31,7 +35,7 @@
 
     - name: Create Python virtualenv with uv
       ansible.builtin.shell:
-        cmd: /root/.local/bin/uv venv {{ cognit_venv_path }}
+        cmd: /root/.local/bin/uv venv {{ cognit_venv_path }} --python 3.12
         creates: "{{ cognit_venv_path }}/bin/python"
 
     - name: Copy locked requirements to target
@@ -82,7 +86,7 @@
       become: true
       become_user: oneadmin
 
-    - name: Disable default marketplaces (removes any apps)
+    - name: Disable default marketplaces
       ansible.builtin.command:
         cmd: "onemarket disable {{ item }}"
       loop: "{{ existing_markets.stdout_lines | map('trim') | list }}"
@@ -123,17 +127,29 @@
 
     # --- Install geocoder gem (needed by geo-carbon hook) ---
 
+    - name: Ensure OpenNebula gems directory exists
+      ansible.builtin.file:
+        path: /usr/share/one/gems
+        state: directory
+        mode: "0755"
+
     - name: Install geocoder Ruby gem into OpenNebula gem path
       ansible.builtin.command:
         cmd: gem install geocoder -v 1.8.6 --install-dir /usr/share/one/gems --no-document
+      register: geocoder_install
+      failed_when: false
+      changed_when: geocoder_install.rc == 0
 
     # --- Register the geo-carbon hook ---
 
-    - name: Create geo-carbon-hook
+    - name: Create geo-carbon-hook (ignore if already exists)
       ansible.builtin.command:
         cmd: onehook create /usr/share/one/geo_carbon_hook.tmpl
       become: true
       become_user: oneadmin
+      register: hook_create
+      failed_when: false
+      changed_when: hook_create.rc == 0
 
     # --- Fix: remove stale terraform that shadows the opennebula-form one ---
 
@@ -141,34 +157,70 @@
       ansible.builtin.file:
         path: /usr/local/bin/terraform
         state: absent
-      when: ansible_os_family == "Debian"
 
-    # --- Fix: patch KVM monitoring bug (info_each discards super return value) ---
+    # --- Fix: patch KVM monitoring bug BEFORE provisioning ---
+    # info_each discards super return value, causing state.rb to crash
+    # with "undefined method 'each' for nil:NilClass"
+
+    - name: Check if kvm.rb already patched
+      ansible.builtin.shell:
+        cmd: grep -c 'result = super(do_process)' /var/lib/one/remotes/im/lib/kvm.rb
+      register: kvm_check
+      changed_when: false
+      failed_when: false
 
     - name: Patch kvm.rb info_each to return super result instead of nil
-      ansible.builtin.replace:
-        path: /var/lib/one/remotes/im/lib/kvm.rb
-        regexp: '(\s+)def info_each\(do_process\)\n(\s+)super\(do_process\)\n(\s+)vms_power\n(\s+)end'
-        replace: '\1def info_each(do_process)\n\2result = super(do_process)\n\3vms_power\n\3result\n\4end'
+      ansible.builtin.shell:
+        cmd: |
+          python3 << 'PYEOF'
+          path = '/var/lib/one/remotes/im/lib/kvm.rb'
+          with open(path) as f:
+              lines = f.readlines()
+          patched = False
+          for i, line in enumerate(lines):
+              if 'def info_each(do_process)' in line and not patched:
+                  for j in range(i+1, min(i+5, len(lines))):
+                      stripped = lines[j].lstrip()
+                      if stripped.startswith('super(do_process)') and 'result' not in lines[j]:
+                          indent = lines[j][:len(lines[j]) - len(stripped)]
+                          lines[j] = indent + 'result = super(do_process)\n'
+                          for k in range(j+1, min(j+5, len(lines))):
+                              if 'vms_power' in lines[k]:
+                                  lines.insert(k+1, indent + 'result\n')
+                                  patched = True
+                                  break
+                          break
+          if patched:
+              with open(path, 'w') as f:
+                  f.writelines(lines)
+              print('PATCHED')
+          else:
+              print('ALREADY_PATCHED')
+          PYEOF
+      when: kvm_check.stdout | trim == "0"
       register: kvm_patch
+      changed_when: "'PATCHED' == (kvm_patch.stdout | default('') | trim)"
 
-    - name: Sync patched remotes to all hosts
+    # --- Fix: symlink Ansible binaries so OneForm can find them ---
+    # pip installs ansible-core into ~oneadmin/.local/bin/ but OneForm
+    # runs as oneadmin and doesn't have that on PATH.
+
+    - name: Symlink oneadmin Ansible binaries to /usr/local/bin
+      ansible.builtin.shell:
+        cmd: |
+          for f in /var/lib/one/.local/bin/ansible*; do
+            [ -x "$f" ] && ln -sf "$f" /usr/local/bin/
+          done
+      changed_when: false
+
+    - name: Verify ansible is in PATH for oneadmin
       ansible.builtin.command:
-        cmd: onehost sync --force
+        cmd: which ansible
       become: true
       become_user: oneadmin
-      when: kvm_patch.changed
+      changed_when: false
 
-    # --- Deploy custom Cognit OnPrem driver for OneForm ---
-
-    - name: Deploy Cognit onprem driver to OneForm external directory
-      ansible.builtin.copy:
-        src: "{{ playbook_dir }}/drivers/cognit_onprem/"
-        dest: /var/lib/one/oneform/drivers/cognit/cognit_onprem/
-        owner: oneadmin
-        group: oneadmin
-        mode: "0755"
-        directory_mode: "0755"
+    # --- OneForm: start with Ansible now in PATH ---
 
     - name: Enable and restart OneForm server
       ansible.builtin.service:
@@ -185,10 +237,54 @@
       delay: 3
       until: oneform_health is not failed
 
-    # --- Provision edge cluster via OneForm ---
+    # --- OneForm registry: add aws and scaleway as external drivers ---
+
+    - name: Ensure OneForm external drivers directory exists
+      ansible.builtin.file:
+        path: /var/lib/one/oneform/drivers
+        state: directory
+        owner: oneadmin
+        group: oneadmin
+        mode: "0755"
+
+    - name: Clone oneform-registry into OneForm drivers directory
+      ansible.builtin.git:
+        repo: https://github.com/OpenNebula/oneform-registry.git
+        dest: /var/lib/one/oneform/drivers/oneform-registry
+        version: master
+        update: true
+      become: true
+      become_user: oneadmin
+
+    - name: Trigger OneForm driver rescan
+      ansible.builtin.command:
+        cmd: oneform sync
+      become: true
+      become_user: oneadmin
+
+    - name: Verify OneForm drivers (list includes aws and scalway)
+      ansible.builtin.command:
+        cmd: oneform list
+      become: true
+      become_user: oneadmin
+      register: oneform_list
+      changed_when: false
+
+    - name: Assert aws and scalway drivers are available
+      ansible.builtin.assert:
+        that:
+          - "'aws' in oneform_list.stdout"
+          - "'scaleway' in oneform_list.stdout"
+        fail_msg: "oneform list did not show aws and scaleway drivers after oneform sync"
+
+    # ===================================================================
+    # Edge cluster provisioning via oneprovision (stock onprem driver)
+    # ===================================================================
 
     - when: edge_host_ips is defined and edge_host_ips | length > 0
       block:
+        # --- SSH key distribution ---
+
         - name: Read oneadmin public SSH key
           ansible.builtin.slurp:
             src: /var/lib/one/.ssh/id_rsa.pub
@@ -206,20 +302,106 @@
           delegate_to: "{{ item }}"
           loop: "{{ edge_host_ips }}"
 
-        - name: Create Cognit OnPrem provider
+        # --- Pre-configure edge hosts (before oneprovision adds them) ---
+
+        - name: Stop unattended-upgrades on edge hosts (holds dpkg lock on fresh VMs)
+          ansible.builtin.shell:
+            cmd: |
+              systemctl stop unattended-upgrades 2>/dev/null
+              systemctl stop apt-daily.timer apt-daily-upgrade.timer 2>/dev/null
+              systemctl disable apt-daily.timer apt-daily-upgrade.timer 2>/dev/null
+              true
+          delegate_to: "{{ item }}"
+          loop: "{{ edge_host_ips }}"
+          changed_when: false
+          failed_when: false
+
+        - name: Purge unattended-upgrades on edge hosts
+          ansible.builtin.apt:
+            name: unattended-upgrades
+            state: absent
+            purge: true
+          delegate_to: "{{ item }}"
+          loop: "{{ edge_host_ips }}"
+          failed_when: false
+
+        - name: Pre-write private APT repo on edge hosts
+          ansible.builtin.copy:
+            dest: /etc/apt/sourwopennebula-cognit-optimizeces.list.d/opennebula.list
+            content: "deb [trusted=yes] {{ one_internal_repo_url | default('http://5.2.88.196/repo/') }} {{ hostvars[item]['ansible_distribution_release'] | default('noble') }} {{ one_internal_repo_component | default('poc-cognit') }}\n"
+            mode: "0644"
+          delegate_to: "{{ item }}"
+          loop: "{{ edge_host_ips }}"
+
+        - name: Update APT cache on edge hosts
+          ansible.builtin.apt:
+            update_cache: true
+          delegate_to: "{{ item }}"
+          loop: "{{ edge_host_ips }}"
+
+        - name: Install sqlite3 Ruby gem on edge hosts (needed by monitoring probes)
           ansible.builtin.command:
-            cmd: oneprovider create cognit_onprem
+            cmd: gem install sqlite3
+          delegate_to: "{{ item }}"
+          loop: "{{ edge_host_ips }}"
+          register: gem_result
+          changed_when: "'Successfully installed' in (gem_result.stdout | default(''))"
+          failed_when: false
+
+        # --- Patch onprem driver template so OneForm Ansible uses our repo ---
+
+        - name: Inject private repo vars into OnPrem ssh_cluster deployment template
+          ansible.builtin.shell:
+            cmd: |
+              python3 << 'PYEOF'
+              path = '/usr/lib/one/oneform/drivers/onprem/ansible/templates/ssh_cluster.j2'
+              marker = '# BEGIN COGNIT PRIVATE REPO OVERRIDE'
+              with open(path) as f:
+                  lines = f.readlines()
+              if any(marker in line for line in lines):
+                  print('ALREADY_PATCHED')
+              else:
+                  out = []
+                  for line in lines:
+                      out.append(line)
+                      if 'one_version:' in line and (line.find(chr(123) + chr(35)) == -1):
+                          out.append('    # BEGIN COGNIT PRIVATE REPO OVERRIDE\n')
+                          out.append('    repos_enabled: [ceph, frr, grafana]\n')
+                          out.append('    opennebula_repo: {changed: false}\n')
+                          out.append('    # END COGNIT PRIVATE REPO OVERRIDE\n')
+                  with open(path, 'w') as f:
+                      f.writelines(out)
+                  print('PATCHED')
+              PYEOF
+          register: template_patch
+          changed_when: "'PATCHED' == (template_patch.stdout | default('') | trim)"
+
+        # --- Create provider + provision ---
+
+        - name: Check if OnPrem provider already exists
+          ansible.builtin.shell:
+            cmd: oneprovider list --no-header | grep -i onprem | awk '{print $1}'
+          become: true
+          become_user: oneadmin
+          register: existing_provider
+          changed_when: false
+          failed_when: false
+
+        - name: Create OnPrem provider (stock driver)
+          ansible.builtin.command:
+            cmd: oneprovider create onprem
           become: true
           become_user: oneadmin
           register: provider_result
+          when: existing_provider.stdout | trim | length == 0
 
         - name: Extract provider ID
           ansible.builtin.set_fact:
-            cognit_provider_id: "{{ provider_result.stdout | regex_search('ID:\\s*(\\d+)', '\\1') | first }}"
+            cognit_provider_id: "{{ existing_provider.stdout | trim if (existing_provider.stdout | trim | length > 0) else (provider_result.stdout | regex_search('ID:\\s*(\\d+)', '\\1') | first) }}"
 
         - name: Render provision inputs JSON
           ansible.builtin.copy:
-            dest: /tmp/cognit_provision_inputs.json
+            dest: /tmp/provision_inputs.json
             mode: "0644"
             content: |
               {
@@ -235,17 +417,119 @@
                 }
               }
 
-        - name: Create edge cluster provision
+        - name: Check if a provision already exists
+          ansible.builtin.shell:
+            cmd: oneprovision list --no-header | awk 'NF{print $1}'
+          become: true
+          become_user: oneadmin
+          register: existing_provision
+          changed_when: false
+          failed_when: false
+
+        - name: Create edge cluster provision (stock onprem driver)
           ansible.builtin.command:
             cmd: >-
-              oneprovision create cognit_onprem
+              oneprovision create onprem
               -p {{ cognit_provider_id }}
               -d ssh_cluster
-              /tmp/cognit_provision_inputs.json
+              /tmp/provision_inputs.json
           become: true
           become_user: oneadmin
           register: provision_result
+          when: existing_provision.stdout | trim | length == 0
 
         - name: Show provision result
           ansible.builtin.debug:
-            msg: "Edge cluster provision created: {{ provision_result.stdout }}"
+            msg: "{{ provision_result.stdout | default('provision already exists') }}"
+
+        # --- Wait for provision to finish (it runs asynchronously) ---
+        # Success = oneprovision list shows state DONE or RUNNING; FAILURE fails the play.
+        # Then onehost list must show hosts not in init/err (monitored).
+
+        - name: Wait for provision to reach RUNNING or DONE (up to 10 min)
+          ansible.builtin.shell:
+            cmd: oneprovision list --no-header | head -1
+          become: true
+          become_user: oneadmin
+          register: prov_state
+          retries: 40
+          delay: 15
+          until: >-
+            'RUNNING' in (prov_state.stdout | default(''))
+            or 'DONE' in (prov_state.stdout | default(''))
+          failed_when: "'FAILURE' in (prov_state.stdout | default(''))"
+          changed_when: false
+
+        - name: Assert provision succeeded (state DONE or RUNNING)
+          ansible.builtin.assert:
+            that:
+              - "'DONE' in prov_state.stdout or 'RUNNING' in prov_state.stdout"
+            fail_msg: "Provision did not reach DONE/RUNNING: {{ prov_state.stdout }}"
+
+        # --- Post-provisioning: sync patched remotes to new hosts ---
+
+        - name: Sync patched monitoring remotes to all hosts
+          ansible.builtin.command:
+            cmd: onehost sync --force
+          become: true
+          become_user: oneadmin
+
+        - name: Wait for hosts to be monitored (up to 3 min)
+          ansible.builtin.shell:
+            cmd: onehost list --no-header | grep -v 'init\|err'
+          become: true
+          become_user: oneadmin
+          register: host_list
+          retries: 12
+          delay: 15
+          until: host_list.stdout | trim | length > 0
+          changed_when: false
+          failed_when: false
+
+        - name: Show final host status
+          ansible.builtin.shell:
+            cmd: onehost list
+          become: true
+          become_user: oneadmin
+          register: host_final
+          changed_when: false
+
+        - name: Host status
+          ansible.builtin.debug:
+            msg: "{{ host_final.stdout }}"
+
+        - name: Assert no host in error state
+          ansible.builtin.assert:
+            that: "'err' not in host_final.stdout"
+            fail_msg: "At least one host is in error. onehost list: {{ host_final.stdout }}"
+
+        - name: Get monitored host count
+          ansible.builtin.shell:
+            cmd: onehost list --no-header | wc -l
+          become: true
+          become_user: oneadmin
+          register: host_count_result
+          changed_when: false
+
+        - name: Assert expected number of hosts are present
+          ansible.builtin.assert:
+            that: "host_count_result.stdout | trim | int >= (edge_host_ips | length)"
+            fail_msg: "Expected at least {{ edge_host_ips | length }} host(s), got {{ host_count_result.stdout | trim }}. onehost list: {{ host_final.stdout }}"
+
+    # --- Ensure OneForm is running at end of playbook ---
+
+    - name: Ensure OneForm server is running
+      ansible.builtin.service:
+        name: opennebula-form
+        enabled: true
+        state: started
+
+    - name: Wait for OneForm API
+      ansible.builtin.uri:
+        url: http://127.0.0.1:13013
+        status_code: [200, 401]
+      register: oneform_final
+      retries: 6
+      delay: 5
+      until: oneform_final is not failed
+      failed_when: false

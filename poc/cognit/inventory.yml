@@ -1,6 +1,7 @@
 ---
-# POC Cognit – frontend-only inventory for one-deploy + cognit package.
-# Replace ansible_host with your Ubuntu 24 frontend VM IP.
+# POC Cognit – frontend-only inventory for one-deploy + cognit packages.
+# Edge hosts are provisioned by oneprovision (stock onprem driver),
+# NOT by one-deploy directly. Set their IPs in edge_host_ips below.
 
 all:
   vars:
@@ -10,15 +11,17 @@ all:
     ensure_hostname: true
     ensure_hosts: true
     one_version: "7.1"
-    # Disable one-deploy's built-in opennebula repo setup
+    # Disable one-deploy's built-in opennebula repo setup (we use our private repo)
     repos_enabled: [ceph, frr, grafana]
     one_pass: opennebulapass
     db_backend: SQLite
     features:
       provision: true
-    # Edge host IPs for oneprovision (used by playbook.yml)
+    # Allow pip install of ansible-core for oneadmin on Python 3.12+ (PEP 668)
+    _pip_extra_args: "--break-system-packages"
+    # Edge host IPs for oneprovision (stock onprem driver)
     edge_host_ips:
-      - 172.20.0.4  # cognit-edge-host-1 (VM 1112)
+      - 172.20.0.78
       # - 172.20.0.X  # add more as needed
     ds:
       mode: ssh
@@ -41,7 +44,7 @@ all:
 frontend:
   hosts:
     f1:
-      ansible_host: 172.20.0.78  # cognit-frontend (VM 1113)
+      ansible_host: 172.20.0.4
 
 node:
-  hosts: {}  # empty, required by one-deploy common role
+  hosts: {}
