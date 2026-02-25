@@ -387,182 +387,9 @@
     # Part B: Export marketplace app + deploy OneFlow service
     # ===================================================================
 
-    # --- Step 1: Check if service template already exported ---
+    # --- Step 0: Check if a running service already exists (skip export/instantiate if so) ---
 
-    - name: Check if service template for {{ flavour }} already exists
-      ansible.builtin.shell:
-        cmd: >-
-          oneflow-template list --json 2>/dev/null |
-          jq -re '(if type=="array" then .[] else ((.DOCUMENT_POOL.DOCUMENT // []) | if type=="array" then .[] else . end) end) | select(.NAME=="Service {{ flavour }}") | .ID' |
-          head -1
-      become: true
-      become_user: oneadmin
-      register: existing_service_template
-      changed_when: false
-      failed_when: false
-
-    # --- Step 2: Find and export the marketplace app ---
-
-    - when: existing_service_template.stdout | trim | length == 0
-      block:
-        - name: Get Cognit Marketplace ID
-          ansible.builtin.shell:
-            cmd: onemarket list --no-header | grep -i "Cognit Marketplace" | awk '{print $1}'
-          become: true
-          become_user: oneadmin
-          register: cognit_market_id
-          changed_when: false
-
-        - name: Disable Cognit marketplace to trigger app refresh
-          ansible.builtin.command:
-            cmd: onemarket disable {{ cognit_market_id.stdout | trim }}
-          become: true
-          become_user: oneadmin
-          when: cognit_market_id.stdout | trim | length > 0
-
-        - name: Enable Cognit marketplace
-          ansible.builtin.command:
-            cmd: onemarket enable {{ cognit_market_id.stdout | trim }}
-          become: true
-          become_user: oneadmin
-          when: cognit_market_id.stdout | trim | length > 0
-
-        - name: Wait for marketplace app 'Service {{ flavour }}' to appear (up to 5 min)
-          ansible.builtin.shell:
-            cmd: >-
-              onemarketapp list --no-header -f "NAME=Service {{ flavour }}" -l ID |
-              awk 'NR==1{print $1}'
-          become: true
-          become_user: oneadmin
-          register: market_app_id
-          retries: 20
-          delay: 15
-          until: market_app_id.stdout is defined and (market_app_id.stdout | trim | length) > 0
-          changed_when: false
-
-        - name: Assert marketplace app exists for flavour {{ flavour }}
-          ansible.builtin.assert:
-            that: market_app_id.stdout | trim | length > 0
-            fail_msg: >-
-              No marketplace app found with name 'Service {{ flavour }}'.
-              Available apps: run 'onemarketapp list' to see options.
-
-        - name: Export 'Service {{ flavour }}' from marketplace (with images and templates)
-          ansible.builtin.command:
-            argv:
-              - onemarketapp
-              - export
-              - "{{ market_app_id.stdout | trim }}"
-              - "Service {{ flavour }}"
-              - -d
-              - "{{ marketplace_datastore_id }}"
-          become: true
-          become_user: oneadmin
-          register: export_result
-
-        - name: Show export result
-          ansible.builtin.debug:
-            msg: "{{ export_result.stdout }}"
-
-    # --- Step 3: Wait for all Cognit images to be ready (downloads can take 30+ min) ---
-
-    - name: Wait for all Cognit images to reach READY state (up to 45 min)
-      ansible.builtin.shell:
-        cmd: >-
-          oneimage list --no-header |
-          grep -i 'Cognit' |
-          grep -v ' rdy ' |
-          wc -l
-      become: true
-      become_user: oneadmin
-      register: images_not_ready
-      retries: 90
-      delay: 30
-      until: (images_not_ready.stdout | trim | int) == 0
-      changed_when: false
-
-    - name: Check for images in error state
-      ansible.builtin.shell:
-        cmd: >-
-          oneimage list --no-header |
-          grep -i 'Cognit' |
-          grep ' err '
-      become: true
-      become_user: oneadmin
-      register: images_in_error
-      changed_when: false
-      failed_when: false
-
-    - name: Assert no Cognit images are in error state
-      ansible.builtin.assert:
-        that: images_in_error.stdout | trim | length == 0
-        fail_msg: "One or more Cognit images are in ERROR state: {{ images_in_error.stdout }}"
-
-    # --- Step 4: Find the service template ID ---
-
-    - name: Get service template ID for 'Service {{ flavour }}'
-      ansible.builtin.shell:
-        cmd: >-
-          oneflow-template list --json |
-          jq -r '.DOCUMENT_POOL.DOCUMENT // [] |
-          if type=="array" then .[] else . end |
-          select(.NAME=="Service {{ flavour }}") | .ID' |
-          head -1
-      become: true
-      become_user: oneadmin
-      register: service_template_id
-      changed_when: false
-
-    - name: Assert service template was found
-      ansible.builtin.assert:
-        that: service_template_id.stdout | trim | length > 0
-        fail_msg: >-
-          Could not find OneFlow service template for 'Service {{ flavour }}'
-          after marketplace export. Check 'oneflow-template list'.
-
-    # --- Step 4b: Resolve OneFlow network from provision cluster (so service uses same network as edge) ---
-
-    - name: Get provision cluster ID (highest ID from onecluster list)
-      ansible.builtin.shell:
-        cmd: onecluster list --no-header | awk '{print $1}' | sort -n | tail -1
-      become: true
-      become_user: oneadmin
-      register: provision_cluster_id
-      changed_when: false
-
-    - name: Get first VNET ID in provision cluster
-      ansible.builtin.shell:
-        cmd: onevnet list --no-header | awk -v c={{ provision_cluster_id.stdout | trim }} '$5==c {print $1; exit}'
-      become: true
-      become_user: oneadmin
-      register: provision_vnet_id
-      changed_when: false
-
-    - name: Set flow_network_id from provision cluster
-      ansible.builtin.set_fact:
-        flow_network_id: "{{ provision_vnet_id.stdout | trim }}"
-
-    - name: Assert provision cluster has a network
-      ansible.builtin.assert:
-        that: flow_network_id | length > 0
-        fail_msg: "No VNET found in provision cluster (ID {{ provision_cluster_id.stdout | trim }}). Run oneprovision first."
-
-    - name: Show OneFlow network used for instantiation
-      ansible.builtin.debug:
-        msg: "Using VNET ID {{ flow_network_id }} for dynamic network '{{ flow_network_name }}' (provision cluster {{ provision_cluster_id.stdout | trim }})"
-
-    - name: Add marketplace datastore to provision cluster (VM disk and NIC must be in same cluster)
-      ansible.builtin.command:
-        cmd: onecluster adddatastore {{ provision_cluster_id.stdout | trim }} {{ marketplace_datastore_id }}
-      become: true
-      become_user: oneadmin
-      register: cluster_add_ds
-      changed_when: cluster_add_ds.rc == 0 and "already" not in (cluster_add_ds.stderr | default('') + cluster_add_ds.stdout | default(''))
-      failed_when: false
-
-    # --- Step 5: Check for existing service, then instantiate ---
-
-    - name: Check if a service for '{{ flavour }}' is already running
+    - name: Check if a service for '{{ flavour }}' already exists
       ansible.builtin.shell:
         cmd: >-
           oneflow list --json 2>/dev/null |
@@ -574,28 +401,212 @@
       changed_when: false
       failed_when: false
 
-    - name: Write OneFlow instantiation options (use existing network)
-      ansible.builtin.copy:
-        dest: /tmp/flow_instantiate_{{ flavour }}.json
-        content: '{"networks_values": [{"{{ flow_network_name }}": {"id": "{{ flow_network_id }}"}}]}'
-        mode: "0644"
-      when: existing_service.stdout | trim | length == 0
-
-    - name: Instantiate OneFlow service from template {{ service_template_id.stdout | trim }}
-      ansible.builtin.command:
-        cmd: >-
-          oneflow-template instantiate {{ service_template_id.stdout | trim }}
-          /tmp/flow_instantiate_{{ flavour }}.json
-      become: true
-      become_user: oneadmin
-      register: instantiate_result
-      when: existing_service.stdout | trim | length == 0
-
-    - name: Show instantiation result
+    - name: Show existing service status
       ansible.builtin.debug:
-        msg: "{{ instantiate_result.stdout | default('Service already exists (ID ' + existing_service.stdout | trim + ')') }}"
+        msg: >-
+          {% if existing_service.stdout | trim | length > 0 %}
+          Service '{{ flavour }}' already exists (ID {{ existing_service.stdout | trim }}). Skipping export/instantiation.
+          {% else %}
+          No existing service for '{{ flavour }}'. Will export and instantiate.
+          {% endif %}
 
-    # --- Step 6: Resolve service ID ---
+    # --- Steps 1-5: Export marketplace app, wait for images, instantiate (only if no service exists) ---
+
+    - when: existing_service.stdout | trim | length == 0
+      block:
+        - name: Check if service template for {{ flavour }} already exists
+          ansible.builtin.shell:
+            cmd: >-
+              oneflow-template list --json 2>/dev/null |
+              jq -re '(if type=="array" then .[] else ((.DOCUMENT_POOL.DOCUMENT // []) | if type=="array" then .[] else . end) end) | select(.NAME=="Service {{ flavour }}") | .ID' |
+              head -1
+          become: true
+          become_user: oneadmin
+          register: existing_service_template
+          changed_when: false
+          failed_when: false
+
+        - when: existing_service_template.stdout | trim | length == 0
+          block:
+            - name: Get Cognit Marketplace ID
+              ansible.builtin.shell:
+                cmd: onemarket list --no-header | grep -i "Cognit Marketplace" | awk '{print $1}'
+              become: true
+              become_user: oneadmin
+              register: cognit_market_id
+              changed_when: false
+
+            - name: Check if marketplace app 'Service {{ flavour }}' already exists
+              ansible.builtin.shell:
+                cmd: >-
+                  onemarketapp list --no-header -f "NAME=Service {{ flavour }}" -l ID |
+                  awk 'NR==1{print $1}'
+              become: true
+              become_user: oneadmin
+              register: market_app_pre_check
+              changed_when: false
+
+            - name: Disable Cognit marketplace to trigger app refresh
+              ansible.builtin.command:
+                cmd: onemarket disable {{ cognit_market_id.stdout | trim }}
+              become: true
+              become_user: oneadmin
+              when: >-
+                cognit_market_id.stdout | trim | length > 0 and
+                (market_app_pre_check.stdout | trim | length) == 0
+
+            - name: Enable Cognit marketplace
+              ansible.builtin.command:
+                cmd: onemarket enable {{ cognit_market_id.stdout | trim }}
+              become: true
+              become_user: oneadmin
+              when: >-
+                cognit_market_id.stdout | trim | length > 0 and
+                (market_app_pre_check.stdout | trim | length) == 0
+
+            - name: Wait for marketplace app 'Service {{ flavour }}' to appear (up to 5 min)
+              ansible.builtin.shell:
+                cmd: >-
+                  onemarketapp list --no-header -f "NAME=Service {{ flavour }}" -l ID |
+                  awk 'NR==1{print $1}'
+              become: true
+              become_user: oneadmin
+              register: market_app_id
+              retries: 20
+              delay: 15
+              until: market_app_id.stdout is defined and (market_app_id.stdout | trim | length) > 0
+              changed_when: false
+
+            - name: Assert marketplace app exists for flavour {{ flavour }}
+              ansible.builtin.assert:
+                that: market_app_id.stdout | trim | length > 0
+                fail_msg: >-
+                  No marketplace app found with name 'Service {{ flavour }}'.
+                  Available apps: run 'onemarketapp list' to see options.
+
+            - name: Export 'Service {{ flavour }}' from marketplace (with images and templates)
+              ansible.builtin.command:
+                argv:
+                  - onemarketapp
+                  - export
+                  - "{{ market_app_id.stdout | trim }}"
+                  - "Service {{ flavour }}"
+                  - -d
+                  - "{{ marketplace_datastore_id }}"
+              become: true
+              become_user: oneadmin
+              register: export_result
+
+            - name: Show export result
+              ansible.builtin.debug:
+                msg: "{{ export_result.stdout }}"
+
+        - name: Wait for all Cognit images to reach READY state (up to 45 min)
+          ansible.builtin.shell:
+            cmd: >-
+              oneimage list --no-header |
+              grep -i 'Cognit' |
+              grep -v ' rdy ' |
+              wc -l
+          become: true
+          become_user: oneadmin
+          register: images_not_ready
+          retries: 90
+          delay: 30
+          until: (images_not_ready.stdout | trim | int) == 0
+          changed_when: false
+
+        - name: Check for images in error state
+          ansible.builtin.shell:
+            cmd: >-
+              oneimage list --no-header |
+              grep -i 'Cognit' |
+              grep ' err '
+          become: true
+          become_user: oneadmin
+          register: images_in_error
+          changed_when: false
+          failed_when: false
+
+        - name: Assert no Cognit images are in error state
+          ansible.builtin.assert:
+            that: images_in_error.stdout | trim | length == 0
+            fail_msg: "One or more Cognit images are in ERROR state: {{ images_in_error.stdout }}"
+
+        - name: Get service template ID for 'Service {{ flavour }}'
+          ansible.builtin.shell:
+            cmd: >-
+              oneflow-template list --json |
+              jq -r '.DOCUMENT_POOL.DOCUMENT // [] |
+              if type=="array" then .[] else . end |
+              select(.NAME=="Service {{ flavour }}") | .ID' |
+              head -1
+          become: true
+          become_user: oneadmin
+          register: service_template_id
+          changed_when: false
+
+        - name: Assert service template was found
+          ansible.builtin.assert:
+            that: service_template_id.stdout | trim | length > 0
+            fail_msg: >-
+              Could not find OneFlow service template for 'Service {{ flavour }}'
+              after marketplace export. Check 'oneflow-template list'.
+
+        - name: Get provision cluster ID (highest ID from onecluster list)
+          ansible.builtin.shell:
+            cmd: onecluster list --no-header | awk '{print $1}' | sort -n | tail -1
+          become: true
+          become_user: oneadmin
+          register: provision_cluster_id
+          changed_when: false
+
+        - name: Get first VNET ID in provision cluster
+          ansible.builtin.shell:
+            cmd: onevnet list --no-header | awk -v c={{ provision_cluster_id.stdout | trim }} '$5==c {print $1; exit}'
+          become: true
+          become_user: oneadmin
+          register: provision_vnet_id
+          changed_when: false
+
+        - name: Set flow_network_id from provision cluster
+          ansible.builtin.set_fact:
+            flow_network_id: "{{ provision_vnet_id.stdout | trim }}"
+
+        - name: Assert provision cluster has a network
+          ansible.builtin.assert:
+            that: flow_network_id | length > 0
+            fail_msg: "No VNET found in provision cluster (ID {{ provision_cluster_id.stdout | trim }}). Run oneprovision first."
+
+        - name: Add marketplace datastore to provision cluster (VM disk and NIC must be in same cluster)
+          ansible.builtin.command:
+            cmd: onecluster adddatastore {{ provision_cluster_id.stdout | trim }} {{ marketplace_datastore_id }}
+          become: true
+          become_user: oneadmin
+          register: cluster_add_ds
+          changed_when: cluster_add_ds.rc == 0 and "already" not in (cluster_add_ds.stderr | default('') + cluster_add_ds.stdout | default(''))
+          failed_when: false
+
+        - name: Write OneFlow instantiation options (use existing network)
+          ansible.builtin.copy:
+            dest: /tmp/flow_instantiate_{{ flavour }}.json
+            content: '{"networks_values": [{"{{ flow_network_name }}": {"id": "{{ flow_network_id }}"}}]}'
+            mode: "0644"
+
+        - name: Instantiate OneFlow service from template
+          ansible.builtin.command:
+            cmd: >-
+              oneflow-template instantiate {{ service_template_id.stdout | trim }}
+              /tmp/flow_instantiate_{{ flavour }}.json
+          become: true
+          become_user: oneadmin
+          register: instantiate_result
+
+        - name: Show instantiation result
+          ansible.builtin.debug:
+            msg: "{{ instantiate_result.stdout }}"
+
+    # --- Step 6: Resolve service ID (always runs) ---
 
     - name: Get service ID
       ansible.builtin.shell:
@@ -628,41 +639,50 @@
       until: (service_state.stdout | trim) == "2"
       changed_when: false
 
-    # --- Step 8: Verify all VMs in the service are RUNNING ---
+    # --- Step 8: Verify Frontend VM is RUNNING ---
 
-    - name: Get VM IDs from service roles
+    - name: Get Frontend VM ID from service
       ansible.builtin.shell:
         cmd: >-
           oneflow show {{ final_service_id.stdout | trim }} --json |
-          jq -r '(.DOCUMENT.TEMPLATE.BODY // .TEMPLATE.BODY).roles[]?.nodes[]?.vm_info.VM |
-          "\(.ID) \(.NAME) STATE=\(.STATE) LCM=\(.LCM_STATE)"'
+          jq -r '(.DOCUMENT.TEMPLATE.BODY // .TEMPLATE.BODY).roles[] |
+          select(.name=="Frontend") | .nodes[0].vm_info.VM.ID'
       become: true
       become_user: oneadmin
-      register: service_vms
+      register: frontend_vm_id_from_service
       changed_when: false
 
-    - name: Show service VM status
-      ansible.builtin.debug:
-        msg: "{{ service_vms.stdout_lines }}"
-
-    - name: Assert all service VMs are in ACTIVE/RUNNING state
+    - name: Check Frontend VM state via onevm (oneflow caches stale vm_info)
       ansible.builtin.shell:
         cmd: >-
-          oneflow show {{ final_service_id.stdout | trim }} --json |
-          jq -e '[(.DOCUMENT.TEMPLATE.BODY // .TEMPLATE.BODY).roles[]?.nodes[]?.vm_info.VM |
-          select(.STATE != "3" or .LCM_STATE != "3")] | length == 0' > /dev/null &&
+          onevm show {{ frontend_vm_id_from_service.stdout | trim }} --json |
+          jq -r '"\(.VM.ID) \(.VM.NAME) STATE=\(.VM.STATE) LCM=\(.VM.LCM_STATE)"'
+      become: true
+      become_user: oneadmin
+      register: frontend_vm_status
+      changed_when: false
+
+    - name: Show Frontend VM status
+      ansible.builtin.debug:
+        msg: "{{ frontend_vm_status.stdout }}"
+
+    - name: Assert Frontend VM is in ACTIVE/RUNNING state
+      ansible.builtin.shell:
+        cmd: >-
+          onevm show {{ frontend_vm_id_from_service.stdout | trim }} --json |
+          jq -e '.VM.STATE == "3" and .VM.LCM_STATE == "3"' > /dev/null &&
           echo OK || echo NOT_READY
       become: true
       become_user: oneadmin
-      register: vms_check
+      register: frontend_vm_check
       changed_when: false
 
-    - name: Assert all VMs are running
+    - name: Assert Frontend VM is running
       ansible.builtin.assert:
-        that: vms_check.stdout | trim == "OK"
+        that: frontend_vm_check.stdout | trim == "OK"
         fail_msg: >-
-          Not all service VMs are in RUNNING state.
-          {{ service_vms.stdout }}
+          Frontend service VM is not in RUNNING state.
+          {{ frontend_vm_status.stdout }}
 
     # ===================================================================
     # Part C: Configure nginx ECF proxy on edge host + update cluster
@@ -764,6 +784,15 @@
       changed_when: true
 
     # --- Step 11: Update provision cluster template ---
+
+    - name: Get provision cluster ID (highest ID from onecluster list)
+      ansible.builtin.shell:
+        cmd: onecluster list --no-header | awk '{print $1}' | sort -n | tail -1
+      become: true
+      become_user: oneadmin
+      register: provision_cluster_id
+      changed_when: false
+      when: provision_cluster_id is not defined or provision_cluster_id.stdout is not defined
 
     - name: Update provision cluster template with edge frontend info
       ansible.builtin.shell:
