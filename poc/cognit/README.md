@@ -79,6 +79,10 @@ Edit `poc/cognit/inventory.yml`:
 - `frontend.hosts.f1.ansible_host` = frontend VM IP
 - `edge_host_ips` list = edge host VM IPs
 
+## Testing offload
+
+To verify offloading works, set `device-runtime-py/examples/cognit-template.yml`: use `api_endpoint: "http://<local_vm_frontend_ip>:1338"` and `credentials: "oneadmin:<one_pass>"`, where `<local_vm_frontend_ip>` is the frontend host (e.g. from `inventory.yml`) and `<one_pass>` is the `one_pass` value in `/one-deploy/poc/cognit/inventory.yml`.
+
 ## Available flavours
 
 Must match marketplace app names (`onemarketapp list`):
