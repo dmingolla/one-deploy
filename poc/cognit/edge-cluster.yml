@@ -22,6 +22,8 @@
     ecf_proxy_port: 1340
     # Port the ECF Frontend VM listens on
     ecf_frontend_port: 1339
+    geolocation: "48.8566,2.3522"
+    is_confidential: false
   pre_tasks:
     - name: Validate flavour parameter
       ansible.builtin.assert:
@@ -35,6 +37,11 @@
         that: provider is defined and provider | length > 0
         fail_msg: >-
           'provider' variable is required. Pass it with -e provider=MyProvider
+
+    - name: Validate is_confidential parameter
+      ansible.builtin.assert:
+        that: is_confidential | string | lower in ['true', 'false']
+        fail_msg: "'is_confidential' must be True or False (default: False)."
   tasks:
     # ===================================================================
     # Part A: Edge cluster provisioning via oneprovision (stock onprem)
@@ -783,24 +790,47 @@
       delegate_to: "{{ ecf_host_ip.stdout | trim }}"
       changed_when: true
 
+    # --- Step 10b: Update ECF Frontend VM config ---
+
+    - name: Get OpenNebula frontend IP from inventory
+      ansible.builtin.set_fact:
+        one_frontend_ip: "{{ hostvars[inventory_hostname].ansible_host }}"
+
+    - name: Update ECF Frontend VM config and restart services
+      ansible.builtin.shell:
+        cmd: |
+          ssh -o StrictHostKeyChecking=no root@{{ ecf_frontend_vm_ip.stdout | trim }} bash -s << REMOTE
+          sed -i 's|^one_xmlrpc:.*|one_xmlrpc: http://{{ one_frontend_ip }}:2633/RPC2|' /etc/cognit-edge_cluster_frontend.conf
+          sed -i 's|^oneflow:.*|oneflow: http://{{ one_frontend_ip }}:2474|' /etc/cognit-edge_cluster_frontend.conf
+          sed -i 's|^cognit_frontend:.*|cognit_frontend: http://{{ one_frontend_ip }}:1338|' /etc/cognit-edge_cluster_frontend.conf
+          pkill -f 'python src/main.py' || true
+          sleep 2
+          /root/start_services.sh
+          sleep 5
+          pgrep -f 'python src/main.py' || exit 1
+          REMOTE
+      become: true
+      become_user: oneadmin
+
     # --- Step 11: Update provision cluster template ---
 
-    - name: Get provision cluster ID (highest ID from onecluster list)
+    - name: Get provision cluster ID for cluster update (always resolve in Part C)
       ansible.builtin.shell:
         cmd: onecluster list --no-header | awk '{print $1}' | sort -n | tail -1
       become: true
       become_user: oneadmin
-      register: provision_cluster_id
+      register: provision_cluster_id_part_c
       changed_when: false
-      when: provision_cluster_id is not defined or provision_cluster_id.stdout is not defined
 
     - name: Update provision cluster template with edge frontend info
       ansible.builtin.shell:
         cmd: |
-          cat << 'TMPL' | onecluster update {{ provision_cluster_id.stdout | trim }} --append
+          cat << 'TMPL' | onecluster update {{ provision_cluster_id_part_c.stdout | trim }} --append
           EDGE_CLUSTER_FRONTEND="http://{{ ecf_host_ip.stdout | trim }}:{{ ecf_proxy_port }}"
           FLAVOURS="{{ flavour }}"
           PROVIDER="{{ provider }}"
+          GEOLOCATION="{{ geolocation }}"
+          IS_CONFIDENTIAL="{{ is_confidential | string | upper }}"
           TMPL
       become: true
       become_user: oneadmin
@@ -808,7 +838,7 @@
 
     - name: Show updated cluster template
       ansible.builtin.shell:
-        cmd: onecluster show {{ provision_cluster_id.stdout | trim }}
+        cmd: onecluster show {{ provision_cluster_id_part_c.stdout | trim }}
       become: true
       become_user: oneadmin
       register: cluster_show
@@ -827,5 +857,6 @@
           is fully deployed and all VMs are running.
           Nginx ECF proxy: http://{{ ecf_host_ip.stdout | trim }}:{{ ecf_proxy_port }}/{{ flavour }}/
           -> {{ ecf_frontend_vm_ip.stdout | trim }}:{{ ecf_frontend_port }}.
-          Cluster {{ provision_cluster_id.stdout | trim }} updated with
-          EDGE_CLUSTER_FRONTEND, FLAVOURS={{ flavour }}, PROVIDER={{ provider }}.
+          Cluster {{ provision_cluster_id_part_c.stdout | trim }} updated with
+          EDGE_CLUSTER_FRONTEND, FLAVOURS={{ flavour }}, PROVIDER={{ provider }},
+          GEOLOCATION={{ geolocation }}, IS_CONFIDENTIAL={{ is_confidential | string | upper }}.
