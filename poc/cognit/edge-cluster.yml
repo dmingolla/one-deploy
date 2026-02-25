@@ -4,7 +4,7 @@
 #
 # Usage:
 #   ansible-playbook -i poc/cognit/inventory.yml poc/cognit/edge-cluster.yml \
-#     -e flavour=NatureFR
+#     -e flavour=NatureFR -e provider=ProviderName
 #
 # Network for the OneFlow service is set automatically from the provision cluster (no override).
 #
@@ -18,6 +18,10 @@
     marketplace_datastore_id: 1
     # OneFlow dynamic network name in the service template (fixed)
     flow_network_name: "Private"
+    # Port used by the nginx ECF proxy on edge hosts
+    ecf_proxy_port: 1340
+    # Port the ECF Frontend VM listens on
+    ecf_frontend_port: 1339
   pre_tasks:
     - name: Validate flavour parameter
       ansible.builtin.assert:
@@ -25,6 +29,12 @@
         fail_msg: >-
           'flavour' variable is required. Pass it with -e flavour=NatureFR
           (valid: NatureFR, SmartCity, EnergyTorch, Energy, CyberSecurity)
+
+    - name: Validate provider parameter
+      ansible.builtin.assert:
+        that: provider is defined and provider | length > 0
+        fail_msg: >-
+          'provider' variable is required. Pass it with -e provider=MyProvider
   tasks:
     # ===================================================================
     # Part A: Edge cluster provisioning via oneprovision (stock onprem)
@@ -72,6 +82,18 @@
             purge: true
           delegate_to: "{{ item }}"
           loop: "{{ edge_host_ips }}"
+          failed_when: false
+
+        - name: Fix /etc/hosts on edge hosts (prevents hostname resolution failures)
+          ansible.builtin.shell:
+            cmd: |
+              HNAME=$(hostname)
+              if ! grep -q "$HNAME" /etc/hosts 2>/dev/null; then
+                sed -i "s/^127.0.0.1.*/127.0.0.1 $HNAME localhost.localdomain localhost/" /etc/hosts
+              fi
+          delegate_to: "{{ item }}"
+          loop: "{{ edge_host_ips }}"
+          changed_when: false
           failed_when: false
 
         - name: Pre-write private APT repo on edge hosts
@@ -271,6 +293,96 @@
             that: "host_count_result.stdout | trim | int >= (edge_host_ips | length)"
             fail_msg: "Expected at least {{ edge_host_ips | length }} host(s), got {{ host_count_result.stdout | trim }}. onehost list: {{ host_final.stdout }}"
 
+        # --- Pre-create bridge on edge hosts so VM deployment doesn't kill connectivity ---
+        #
+        # WHY THIS IS NEEDED:
+        # The oneprovision VNET uses BRIDGE=onebr1 with PHYDEV=eth0.  When OpenNebula
+        # deploys the first VM on an edge host, it creates the bridge and "enslaves"
+        # eth0 -- meaning eth0 becomes a port of the bridge.
+        # At that point eth0 is no longer a standalone interface: the
+        # Linux kernel stops delivering packets addressed to eth0's IP to the host's
+        # network stack, because traffic now flows through the bridge instead.
+        # Result: the host becomes unreachable (ping/SSH fail).
+        #
+        # FIX: before any VM is deployed, we pre-create the bridge, move the host's
+        # IP from eth0 to the bridge, and enslave eth0 ourselves.  When OpenNebula
+        # later tries to create the bridge, it already exists and just attaches the
+        # VM's tap device -- no connectivity loss.
+        #
+        # The script also writes a netplan config (90-onebr-bridge.yaml) so the
+        # bridge setup survives reboots.
+        #
+        # NOTE: the SSH connection to the edge host will briefly drop while the IP
+        # moves.  The script is run via nohup so it completes even if SSH disconnects,
+        # and we retry pings until the host is reachable again.
+
+        - name: Get first VNET in provision cluster (for bridge name)
+          ansible.builtin.shell:
+            cmd: >-
+              onecluster show $(onecluster list --no-header | awk '{print $1}' | sort -n | tail -1) --json |
+              jq -r '.CLUSTER.VNETS.ID | if type=="array" then .[0] else . end'
+          become: true
+          become_user: oneadmin
+          register: prov_vnet_for_bridge
+          changed_when: false
+
+        - name: Get VNET bridge name
+          ansible.builtin.shell:
+            cmd: >-
+              onevnet show {{ prov_vnet_for_bridge.stdout | trim }} --json |
+              jq -r '.VNET.TEMPLATE.BRIDGE'
+          become: true
+          become_user: oneadmin
+          register: vnet_bridge_name
+          changed_when: false
+
+        - name: Write bridge setup script on edge hosts
+          ansible.builtin.copy:
+            dest: /tmp/setup_bridge.sh
+            mode: "0755"
+            content: |
+              #!/bin/bash
+              BRIDGE="{{ vnet_bridge_name.stdout | trim }}"
+              DEV="eth0"
+              ADDR=$(ip -4 -o addr show dev $DEV 2>/dev/null | awk '{print $4}' | head -1)
+              GW=$(ip route show default dev $DEV 2>/dev/null | awk '/default/{print $3}' | head -1)
+              [ -z "$ADDR" ] && exit 0
+              [ -z "$GW" ] && GW="{{ vn.admin_net.template.GATEWAY | default('172.20.0.1') }}"
+              if ip -4 addr show dev $BRIDGE 2>/dev/null | grep -q "${ADDR%/*}"; then
+                exit 0
+              fi
+              ip link add $BRIDGE type bridge 2>/dev/null || true
+              ip link set $BRIDGE up
+              ip link set $DEV master $BRIDGE 2>/dev/null || true
+              ip addr del $ADDR dev $DEV 2>/dev/null || true
+              ip addr add $ADDR dev $BRIDGE
+              ip route replace default via $GW dev $BRIDGE
+              HOST_IP="${ADDR%/*}"
+              PREFIX="${ADDR#*/}"
+              printf 'network:\n  version: 2\n  ethernets:\n    %s:\n      dhcp4: false\n  bridges:\n    %s:\n      interfaces: [%s]\n      addresses: [%s/%s]\n      routes:\n        - to: default\n          via: %s\n      dhcp4: false\n' \
+                "$DEV" "$BRIDGE" "$DEV" "$HOST_IP" "$PREFIX" "$GW" \
+                > /etc/netplan/90-onebr-bridge.yaml
+              chmod 600 /etc/netplan/90-onebr-bridge.yaml
+          delegate_to: "{{ item }}"
+          loop: "{{ edge_host_ips }}"
+
+        - name: Run bridge setup (fire-and-forget to survive SSH drop)
+          ansible.builtin.shell:
+            cmd: nohup /tmp/setup_bridge.sh > /dev/null 2>&1 &
+          delegate_to: "{{ item }}"
+          loop: "{{ edge_host_ips }}"
+          changed_when: false
+
+        - name: Wait for edge hosts to be reachable after bridge reconfiguration (up to 60s)
+          ansible.builtin.command:
+            cmd: ping -c 1 -W 2 {{ item }}
+          loop: "{{ edge_host_ips }}"
+          retries: 15
+          delay: 4
+          register: ping_result
+          until: ping_result.rc == 0
+          changed_when: false
+
     # ===================================================================
     # Part B: Export marketplace app + deploy OneFlow service
     # ===================================================================
@@ -386,13 +498,15 @@
         that: images_in_error.stdout | trim | length == 0
         fail_msg: "One or more Cognit images are in ERROR state: {{ images_in_error.stdout }}"
 
-    # --- Step 4: Find the service template ID (needed for VM template discovery and instantiation) ---
+    # --- Step 4: Find the service template ID ---
 
     - name: Get service template ID for 'Service {{ flavour }}'
       ansible.builtin.shell:
         cmd: >-
           oneflow-template list --json |
-          jq -r '(if type=="array" then .[] else ((.DOCUMENT_POOL.DOCUMENT // []) | if type=="array" then .[] else . end) end) | select(.NAME=="Service {{ flavour }}") | .ID' |
+          jq -r '.DOCUMENT_POOL.DOCUMENT // [] |
+          if type=="array" then .[] else . end |
+          select(.NAME=="Service {{ flavour }}") | .ID' |
           head -1
       become: true
       become_user: oneadmin
@@ -405,37 +519,6 @@
         fail_msg: >-
           Could not find OneFlow service template for 'Service {{ flavour }}'
           after marketplace export. Check 'oneflow-template list'.
-
-    # --- TEMPORARY: Reduce service VM memory so it fits on small edge host ---
-    # TODO: This is a temporary workaround. On-prem (ssh_cluster) provision does
-    # not allow node resource (memory/CPU) decisions
-
-    - name: Get VM template IDs from OneFlow service template (roles)
-      ansible.builtin.shell:
-        cmd: >-
-          oneflow-template show {{ service_template_id.stdout | trim }} --json |
-          jq -r '(.DOCUMENT.TEMPLATE.BODY // .TEMPLATE.BODY).roles[]?.template_id // .vm_template // empty' |
-          sort -u
-      become: true
-      become_user: oneadmin
-      register: service_vm_template_ids
-      changed_when: false
-
-    - name: Temporary – write memory override for small edge host (1024 MB)
-      ansible.builtin.copy:
-        dest: /tmp/oneflow_memory_override.txt
-        content: "MEMORY=1024\n"
-        mode: "0644"
-
-    - name: Temporary – set each service VM template memory to 1024 MB
-      ansible.builtin.command:
-        cmd: onetemplate update {{ item }} /tmp/oneflow_memory_override.txt --append
-      become: true
-      become_user: oneadmin
-      loop: "{{ service_vm_template_ids.stdout_lines | default([]) | map('trim') | select() | list }}"
-      register: _tmpl_mem
-      changed_when: _tmpl_mem.rc == 0
-      failed_when: false
 
     # --- Step 4b: Resolve OneFlow network from provision cluster (so service uses same network as edge) ---
 
@@ -581,8 +664,139 @@
           Not all service VMs are in RUNNING state.
           {{ service_vms.stdout }}
 
+    # ===================================================================
+    # Part C: Configure nginx ECF proxy on edge host + update cluster
+    # ===================================================================
+
+    # --- Step 9: Discover ECF Frontend VM IP and its edge host ---
+
+    - name: Get Frontend role VM ID from OneFlow service
+      ansible.builtin.shell:
+        cmd: >-
+          oneflow show {{ final_service_id.stdout | trim }} --json |
+          jq -r '(.DOCUMENT.TEMPLATE.BODY // .TEMPLATE.BODY).roles[] |
+          select(.name=="Frontend") | .nodes[0].vm_info.VM.ID'
+      become: true
+      become_user: oneadmin
+      register: ecf_frontend_vm_id
+      changed_when: false
+
+    - name: Assert Frontend VM was found
+      ansible.builtin.assert:
+        that: ecf_frontend_vm_id.stdout | trim | length > 0
+        fail_msg: "Could not find 'Frontend' role VM in OneFlow service {{ final_service_id.stdout | trim }}."
+
+    - name: Get ECF Frontend VM IP
+      ansible.builtin.shell:
+        cmd: >-
+          onevm show {{ ecf_frontend_vm_id.stdout | trim }} --json |
+          jq -r '.VM.TEMPLATE.NIC | if type=="array" then .[0].IP else .IP end'
+      become: true
+      become_user: oneadmin
+      register: ecf_frontend_vm_ip
+      changed_when: false
+
+    - name: Get edge host ID (HID) where Frontend VM runs
+      ansible.builtin.shell:
+        cmd: >-
+          onevm show {{ ecf_frontend_vm_id.stdout | trim }} --json |
+          jq -r '.VM.HISTORY_RECORDS.HISTORY | if type=="array" then .[-1].HID else .HID end'
+      become: true
+      become_user: oneadmin
+      register: ecf_host_hid
+      changed_when: false
+
+    - name: Get edge host IP from host ID
+      ansible.builtin.shell:
+        cmd: >-
+          onehost show {{ ecf_host_hid.stdout | trim }} --json |
+          jq -r '.HOST.NAME'
+      become: true
+      become_user: oneadmin
+      register: ecf_host_ip
+      changed_when: false
+
+    - name: Show ECF proxy targets
+      ansible.builtin.debug:
+        msg: >-
+          ECF Frontend VM {{ ecf_frontend_vm_id.stdout | trim }}
+          (IP {{ ecf_frontend_vm_ip.stdout | trim }})
+          on edge host {{ ecf_host_ip.stdout | trim }}.
+          Nginx will proxy {{ ecf_host_ip.stdout | trim }}:{{ ecf_proxy_port }}
+          -> {{ ecf_frontend_vm_ip.stdout | trim }}:{{ ecf_frontend_port }}
+
+    # --- Step 10: Install nginx and configure ECF proxy on the edge host ---
+
+    - name: Install nginx on edge host
+      ansible.builtin.apt:
+        name: nginx
+        state: present
+        update_cache: true
+      delegate_to: "{{ ecf_host_ip.stdout | trim }}"
+
+    - name: Write nginx ECF proxy config for {{ flavour }}
+      ansible.builtin.copy:
+        dest: "/etc/nginx/sites-available/ecf-proxy-{{ flavour }}.conf"
+        mode: "0644"
+        content: |
+          server {
+              listen {{ ecf_proxy_port }};
+
+              location /{{ flavour }}/ {
+                  proxy_pass http://{{ ecf_frontend_vm_ip.stdout | trim }}:{{ ecf_frontend_port }}/;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+              }
+          }
+      delegate_to: "{{ ecf_host_ip.stdout | trim }}"
+
+    - name: Enable nginx ECF proxy site
+      ansible.builtin.file:
+        src: "/etc/nginx/sites-available/ecf-proxy-{{ flavour }}.conf"
+        dest: "/etc/nginx/sites-enabled/ecf-proxy-{{ flavour }}.conf"
+        state: link
+      delegate_to: "{{ ecf_host_ip.stdout | trim }}"
+
+    - name: Test and reload nginx
+      ansible.builtin.shell:
+        cmd: nginx -t && systemctl reload nginx
+      delegate_to: "{{ ecf_host_ip.stdout | trim }}"
+      changed_when: true
+
+    # --- Step 11: Update provision cluster template ---
+
+    - name: Update provision cluster template with edge frontend info
+      ansible.builtin.shell:
+        cmd: |
+          cat << 'TMPL' | onecluster update {{ provision_cluster_id.stdout | trim }} --append
+          EDGE_CLUSTER_FRONTEND="http://{{ ecf_host_ip.stdout | trim }}:{{ ecf_proxy_port }}"
+          FLAVOURS="{{ flavour }}"
+          PROVIDER="{{ provider }}"
+          TMPL
+      become: true
+      become_user: oneadmin
+      register: cluster_update_result
+
+    - name: Show updated cluster template
+      ansible.builtin.shell:
+        cmd: onecluster show {{ provision_cluster_id.stdout | trim }}
+      become: true
+      become_user: oneadmin
+      register: cluster_show
+      changed_when: false
+
+    - name: Cluster template
+      ansible.builtin.debug:
+        msg: "{{ cluster_show.stdout }}"
+
+    # --- Final ---
+
     - name: Service {{ flavour }} deployed successfully
       ansible.builtin.debug:
         msg: >-
           OneFlow service '{{ flavour }}' (ID {{ final_service_id.stdout | trim }})
           is fully deployed and all VMs are running.
+          Nginx ECF proxy: http://{{ ecf_host_ip.stdout | trim }}:{{ ecf_proxy_port }}/{{ flavour }}/
+          -> {{ ecf_frontend_vm_ip.stdout | trim }}:{{ ecf_frontend_port }}.
+          Cluster {{ provision_cluster_id.stdout | trim }} updated with
+          EDGE_CLUSTER_FRONTEND, FLAVOURS={{ flavour }}, PROVIDER={{ provider }}.

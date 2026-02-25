@@ -16,12 +16,18 @@ deploy-frontend-and-node.yml          (full deploy, runs everything)
   │     ├── Monitoring fixes (kvm.rb patch, sqlite3 gem)
   │     ├── Ansible symlink fix for OneForm
   │     └── OneForm restart + driver registry (aws, scaleway)
-  └── edge-cluster.yml                (run per flavour)
-        ├── oneprovision create onprem (edge cluster)
-        ├── Export marketplace app (Service <flavour>)
-        ├── Wait for images to download
-        ├── Instantiate OneFlow service
-        └── Wait for all service VMs to be running
+  └── edge-cluster.yml                (run per flavour + provider)
+        ├── Part A: oneprovision create onprem (edge cluster)
+        │     └── Pre-create bridge on edge hosts (fixes eth0 enslavement)
+        ├── Part B: Export marketplace app + deploy OneFlow service
+        │     ├── Export marketplace app (Service <flavour>)
+        │     ├── Wait for images to download
+        │     ├── Instantiate OneFlow service
+        │     └── Wait for all service VMs to be running
+        └── Part C: Configure nginx ECF proxy + update cluster
+              ├── Discover ECF Frontend VM IP from OneFlow service
+              ├── Install nginx on edge host, proxy :1340 -> VM:1339
+              └── Update cluster template (EDGE_CLUSTER_FRONTEND, FLAVOURS, PROVIDER)
 ```
 
 ## Prerequisites
@@ -29,6 +35,7 @@ deploy-frontend-and-node.yml          (full deploy, runs everything)
 - Ubuntu 24.04 VMs with root SSH, reachable from your laptop:
   - 1 frontend VM (4 GB RAM, 2 vCPUs, 20 GB disk)
   - 1+ edge host VMs (KVM nodes)
+- **CPU model must be `host-passthrough`** on all VMs that act as KVM hosts (edge host VMs). Without it, the VMX flag is not exposed to the guest and nested KVM will fail (`/dev/kvm` missing, libvirt error: "does not support virt type 'kvm'").
 - All VMs must reach `http://5.2.88.196/repo/` (private ONE+Cognit APT repo)
 - Edge VMs must be SSH-reachable from the frontend
 
@@ -39,7 +46,7 @@ deploy-frontend-and-node.yml          (full deploy, runs everything)
 ```bash
 ansible-playbook -i poc/cognit/inventory.yml \
   poc/cognit/deploy-frontend-and-node.yml \
-  -e flavour=NatureFR
+  -e flavour=NatureFR -e provider=ProviderName
 ```
 
 ### Option B: Run playbooks independently
@@ -56,16 +63,14 @@ ansible-playbook -i poc/cognit/inventory.yml \
 ```bash
 ansible-playbook -i poc/cognit/inventory.yml \
   poc/cognit/edge-cluster.yml \
-  -e flavour=NatureFR
+  -e flavour=NatureFR -e provider=ProviderName
 ```
 
 Run this step multiple times with different flavours:
 
 ```bash
-ansible-playbook -i poc/cognit/inventory.yml poc/cognit/edge-cluster.yml -e flavour=SmartCity
-ansible-playbook -i poc/cognit/inventory.yml poc/cognit/edge-cluster.yml -e flavour=EnergyTorch
-ansible-playbook -i poc/cognit/inventory.yml poc/cognit/edge-cluster.yml -e flavour=Energy
-ansible-playbook -i poc/cognit/inventory.yml poc/cognit/edge-cluster.yml -e flavour=CyberSecurity
+ansible-playbook -i poc/cognit/inventory.yml poc/cognit/edge-cluster.yml -e flavour=SmartCity -e provider=SomeProvider
+ansible-playbook -i poc/cognit/inventory.yml poc/cognit/edge-cluster.yml -e flavour=EnergyTorch -e provider=SomeProvider
 ```
 
 ## Configuration

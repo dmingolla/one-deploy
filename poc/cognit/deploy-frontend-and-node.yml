@@ -3,7 +3,7 @@
 #
 # Usage:
 #   ansible-playbook -i poc/cognit/inventory.yml \
-#     poc/cognit/deploy-frontend-and-node.yml -e flavour=NatureFR
+#     poc/cognit/deploy-frontend-and-node.yml -e flavour=NatureFR -e provider=ProviderName
 - name: Bootstrap frontend with internal ONE repo
   hosts: frontend
   gather_facts: true
