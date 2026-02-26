@@ -46,7 +46,7 @@ deploy-frontend-and-node.yml          (full deploy, runs everything)
 ```bash
 ansible-playbook -i poc/cognit/inventory.yml \
   poc/cognit/deploy-frontend-and-node.yml \
-  -e flavour=NatureFR -e provider=ProviderName
+  -e flavour=NatureFR -e provider=ProviderName -e geolocation="43.2965,5.3698" -e is_confidential=false
 ```
 
 ### Option B: Run playbooks independently

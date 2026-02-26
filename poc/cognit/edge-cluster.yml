@@ -6,6 +6,10 @@
 #   ansible-playbook -i poc/cognit/inventory.yml poc/cognit/edge-cluster.yml \
 #     -e flavour=NatureFR -e provider=ProviderName
 #
+# Optional parameters (defaults shown):
+#   -e geolocation="48.8566,2.3522"   # Cluster GEOLOCATION attribute (lat,lon)
+#   -e is_confidential=false          # true or false
+#
 # Network for the OneFlow service is set automatically from the provision cluster (no override).
 #
 # Available flavours (must match marketplace app names):
@@ -443,7 +447,7 @@
               register: cognit_market_id
               changed_when: false
 
-            - name: Check if marketplace app 'Service {{ flavour }}' already exists
+            - name: Check if marketplace app 'Service {{ flavour }}' already exists (retry up to 3 times)
               ansible.builtin.shell:
                 cmd: >-
                   onemarketapp list --no-header -f "NAME=Service {{ flavour }}" -l ID |
@@ -451,25 +455,65 @@
               become: true
               become_user: oneadmin
               register: market_app_pre_check
+              retries: 3
+              delay: 5
+              until: market_app_pre_check.stdout is defined and (market_app_pre_check.stdout | trim | length) > 0
               changed_when: false
+              failed_when: false
 
-            - name: Disable Cognit marketplace to trigger app refresh
-              ansible.builtin.command:
-                cmd: onemarket disable {{ cognit_market_id.stdout | trim }}
-              become: true
-              become_user: oneadmin
-              when: >-
-                cognit_market_id.stdout | trim | length > 0 and
-                (market_app_pre_check.stdout | trim | length) == 0
+            - name: Set need marketplace refresh (app missing and market ID known)
+              ansible.builtin.set_fact:
+                need_market_refresh: "{{ (cognit_market_id.stdout | trim | length > 0) and (market_app_pre_check.stdout | default('') | trim | length == 0) }}"
 
-            - name: Enable Cognit marketplace
-              ansible.builtin.command:
-                cmd: onemarket enable {{ cognit_market_id.stdout | trim }}
-              become: true
-              become_user: oneadmin
-              when: >-
-                cognit_market_id.stdout | trim | length > 0 and
-                (market_app_pre_check.stdout | trim | length) == 0
+            - name: Trigger Cognit marketplace refresh (disable/enable cycle 1)
+              block:
+                - name: Disable Cognit marketplace (cycle 1)
+                  ansible.builtin.command:
+                    cmd: onemarket disable {{ cognit_market_id.stdout | trim }}
+                  become: true
+                  become_user: oneadmin
+
+                - name: Pause after disable to let monitoring process
+                  ansible.builtin.pause:
+                    seconds: 10
+                    prompt: ""
+
+                - name: Enable Cognit marketplace (cycle 1)
+                  ansible.builtin.command:
+                    cmd: onemarket enable {{ cognit_market_id.stdout | trim }}
+                  become: true
+                  become_user: oneadmin
+
+                - name: Pause after enable to let app list refresh
+                  ansible.builtin.pause:
+                    seconds: 15
+                    prompt: ""
+              when: need_market_refresh | bool
+
+            - name: Trigger Cognit marketplace refresh (disable/enable cycle 2)
+              block:
+                - name: Disable Cognit marketplace (cycle 2)
+                  ansible.builtin.command:
+                    cmd: onemarket disable {{ cognit_market_id.stdout | trim }}
+                  become: true
+                  become_user: oneadmin
+
+                - name: Pause after disable (cycle 2)
+                  ansible.builtin.pause:
+                    seconds: 10
+                    prompt: ""
+
+                - name: Enable Cognit marketplace (cycle 2)
+                  ansible.builtin.command:
+                    cmd: onemarket enable {{ cognit_market_id.stdout | trim }}
+                  become: true
+                  become_user: oneadmin
+
+                - name: Pause after enable (cycle 2)
+                  ansible.builtin.pause:
+                    seconds: 15
+                    prompt: ""
+              when: need_market_refresh | bool
 
             - name: Wait for marketplace app 'Service {{ flavour }}' to appear (up to 5 min)
               ansible.builtin.shell:
@@ -804,9 +848,9 @@
           sed -i 's|^oneflow:.*|oneflow: http://{{ one_frontend_ip }}:2474|' /etc/cognit-edge_cluster_frontend.conf
           sed -i 's|^cognit_frontend:.*|cognit_frontend: http://{{ one_frontend_ip }}:1338|' /etc/cognit-edge_cluster_frontend.conf
           pkill -f 'python src/main.py' || true
-          sleep 2
+          sleep 4
           /root/start_services.sh
-          sleep 5
+          sleep 8
           pgrep -f 'python src/main.py' || exit 1
           REMOTE
       become: true
