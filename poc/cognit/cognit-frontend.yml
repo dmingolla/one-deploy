@@ -9,7 +9,7 @@
       - opennebula-cognit-frontend
       - opennebula-cognit-optimizer
       - opennebula-cognit-devices-estimated-load
-    cognit_venv_path: "/usr/share/one/cognit-frontend/python-venv"
+    cognit_venv_path: "/usr/share/one/cognit-venv"
     cognit_requirements: "{{ playbook_dir }}/cognit_deb_requirements.txt"
   tasks:
     # --- Kill unattended-upgrades so it doesn't hold the dpkg lock ---
@@ -44,17 +44,11 @@
 
     # --- Python venv setup (before deb packages so services can start) ---
 
-    - name: Install git (needed for pyoneai from GitHub)
+    - name: Install git (required by ansible.builtin.git tasks)
       ansible.builtin.apt:
         name: [git]
         state: present
       when: ansible_os_family == "Debian"
-
-    - name: Ensure GitHub SSH host key is trusted
-      ansible.builtin.known_hosts:
-        name: github.com
-        key: "{{ lookup('pipe', 'ssh-keyscan -t ed25519 github.com 2>/dev/null') }}"
-        state: present
 
     - name: Install uv
       ansible.builtin.shell:
@@ -72,36 +66,9 @@
         dest: /tmp/cognit-requirements.lock
         mode: "0644"
 
-    - name: Rewrite git URLs to use token auth (when no SSH agent)
-      ansible.builtin.replace:
-        path: /tmp/cognit-requirements.lock
-        regexp: 'git\+ssh://git@github\.com/'
-        replace: 'git+https://x-access-token:{{ github_token }}@github.com/'
-      when: github_token is defined and github_token | length > 0
-      no_log: true
-      # --- TODO: To remove once the repo is public ---
-    - name: Check git SSH access for private requirements
-      ansible.builtin.shell:
-        cmd: grep -q 'git+ssh://' /tmp/cognit-requirements.lock && echo HAS_SSH || echo NO_SSH
-      register: _req_has_ssh
-      changed_when: false
-
-    - name: Fail early if git+ssh URLs present without auth method
-      ansible.builtin.fail:
-        msg: >-
-          Requirements contain git+ssh:// URLs but no authentication is available.
-          Either forward your SSH agent (ssh-add your GitHub key before running)
-          or pass -e github_token=YOUR_PAT to rewrite URLs to HTTPS.
-      when:
-        - _req_has_ssh.stdout | trim == "HAS_SSH"
-        - github_token is not defined or github_token | length == 0
-        - lookup('pipe', 'ssh-add -l 2>/dev/null || true') is not search('SHA')
-
     - name: Install locked requirements with uv
       ansible.builtin.shell:
         cmd: timeout 600 /root/.local/bin/uv pip install --python {{ cognit_venv_path }}/bin/python -r /tmp/cognit-requirements.lock
-      environment:
-        GIT_TERMINAL_PROMPT: "0"
 
     # --- Cognit apt packages ---
 
@@ -111,13 +78,20 @@
         state: present
       when: ansible_os_family == "Debian"
 
+    - name: Fix pyoneai __pycache__ ownership for onehost sync
+      ansible.builtin.shell:
+        cmd: chown -R oneadmin:oneadmin /var/lib/one/remotes/im/lib/python/pyoneai/
+      changed_when: false
+      failed_when: false
+
     # --- Enable and start Cognit services ---
 
-    - name: Enable and start Cognit services
-      ansible.builtin.service:
+    - name: Enable and restart Cognit services
+      ansible.builtin.systemd:
         name: "{{ item }}"
         enabled: true
-        state: started
+        state: restarted
+        daemon_reload: true
       loop:
         - opennebula-cognit-frontend
         - opennebula-cognit-optimizer
