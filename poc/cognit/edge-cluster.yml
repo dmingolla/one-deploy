@@ -892,6 +892,27 @@
       ansible.builtin.debug:
         msg: "{{ cluster_show.stdout }}"
 
+    # --- Step 12: Restart Cognit frontend, then ECF services ---
+
+    - name: Restart opennebula-cognit-frontend on frontend host
+      ansible.builtin.systemd:
+        name: opennebula-cognit-frontend
+        state: restarted
+      become: true
+
+    - name: Restart ECF services on Frontend VM
+      ansible.builtin.shell:
+        cmd: |
+          ssh -o StrictHostKeyChecking=no root@{{ ecf_frontend_vm_ip.stdout | trim }} bash -s << 'REMOTE'
+          pkill -f 'python src/main.py' || true
+          sleep 4
+          /root/start_services.sh
+          sleep 8
+          pgrep -f 'python src/main.py' || exit 1
+          REMOTE
+      become: true
+      become_user: oneadmin
+
     # --- Final ---
 
     - name: Service {{ flavour }} deployed successfully
